@@ -1,5 +1,5 @@
 # aart-os
-mcu OS written in rust
+mcu OS written in rust   
 cd stm32_os  
 cargo clean   
 cargo test --target thumbv7em-none-eabihf --features qemu   
