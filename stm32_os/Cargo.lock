@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "aart-core"
+version = "0.1.0"
+
+[[package]]
 name = "bare-metal"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -309,6 +313,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "stm32_os"
 version = "0.1.0"
 dependencies = [
+ "aart-core",
  "cortex-m",
  "cortex-m-rt",
  "defmt 0.3.100",
