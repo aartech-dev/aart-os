@@ -1,6 +1,32 @@
 [target.thumbv7em-none-eabihf]
-runner = "qemu-system-arm -cpu cortex-m4 -machine netduinoplus2 -nographic -semihosting-config enable=on,target=native -kernel"
+# SAFE DEFAULT = real hardware via probe-rs.
+#
+# Why this is the default: if you run a bare `cargo test`, cargo compiles the
+# `#[cfg(not(feature = "qemu"))]` real_tests module, which calls the genuine HAL
+# `RccExt::freeze()`. That path busy-polls the RCC clock-ready bits. Under QEMU
+# those bits never assert, so it hangs forever ("waiting for the timer to init").
+# With probe-rs as the default runner, a bare `cargo test` with no board attached
+# fails FAST ("no probe found") instead of hanging. The dangerous path is now
+# impossible to hit by accident.
+#
+# Confirm the exact chip string with: `probe-rs chip list | grep -i g431`
+# Nucleo-G431RB = STM32G431RBT6 -> STM32G431RBTx
+runner = "probe-rs run --chip STM32G431RBTx"
+
 rustflags = [
-  "-C", "link-arg=-Tlink.x"
-  # Removed: "-C", "link-arg=-nostartfiles"
+  "-C", "link-arg=-Tlink.x",
+  # Needed so probe-rs can locate/decode the interned defmt strings in the ELF.
+  # (Your manual _defmt_timestamp / _defmt_panic stubs still work alongside this;
+  #  defmt.x only adds linker sections, it does not redefine those symbols.)
+  "-C", "link-arg=-Tdefmt.x",
 ]
+
+[alias]
+# `cargo hw`   -> flash + run the real-hardware tests on the Nucleo (probe-rs).
+hw = ["test", "--target", "thumbv7em-none-eabihf"]
+
+# `cargo qemu` -> run the spoofed CPU-level tests under QEMU. This overrides the
+# runner back to qemu-system-arm ONLY for this invocation, and it always sets
+# `--features qemu`, so the QEMU runner and the QEMU (register-spoofed) test
+# module can never be mismatched.
+qemu = ["test", "--target", "thumbv7em-none-eabihf", "--features", "qemu", "--config", 'target.thumbv7em-none-eabihf.runner="qemu-system-arm -cpu cortex-m4 -machine netduinoplus2 -nographic -semihosting-config enable=on,target=native -kernel"']

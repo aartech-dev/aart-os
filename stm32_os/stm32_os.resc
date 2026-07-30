@@ -1,0 +1,38 @@
+:name: aart-os STM32G431
+:description: Minimal G431 emulation to run the aart-os HAL tests without hardware
+
+# ---------------------------------------------------------------------------
+# Usage:
+#   1. Build the test ELF (real-hardware path, NOT the qemu feature):
+#        cargo test --target thumbv7em-none-eabihf --no-run
+#      cargo prints an "Executable ... (target/.../deps/hal_test-<hash>)" line.
+#   2. Point $bin at that ELF (the hash changes per build), then:
+#        renode renode/stm32_os.resc
+#   3. In the Renode monitor: `start`
+#
+# You can also override on the command line:
+#   renode -e "$bin=@/abs/path/to/hal_test-<hash>; i @renode/stm32_os.resc; start"
+# ---------------------------------------------------------------------------
+
+$bin ?= @target/thumbv7em-none-eabihf/debug/deps/hal_test
+
+mach create "aart-os"
+machine LoadPlatformDescription @renode/stm32g431.repl
+
+# G4 boots from flash aliased at 0x0; make the CPU fetch the vector table there.
+sysbus.cpu VectorTableOffset 0x08000000
+
+# defmt-test signals pass/fail by exiting via ARM semihosting; Renode reports it.
+# (Property/registration name for semihosting varies by Renode version - if the
+#  next line errors, delete it; recent Renode enables cortex-m semihosting by
+#  default when the firmware issues the semihosting BKPT.)
+# sysbus.cpu EnableSemihosting true
+
+sysbus LoadELF $bin
+
+echo ""
+echo "Loaded aart-os test ELF onto emulated STM32G431."
+echo "  start                         - begin execution"
+echo "  sysbus.gpioPortA              - inspect GPIOA (PA5 = LED)"
+echo "  cpu Step / cpu PC             - single-step / read PC if it stalls"
+echo ""

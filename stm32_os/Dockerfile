@@ -19,4 +19,15 @@ COPY src src
 COPY tests tests
 COPY memory.x memory.x
 
-CMD ["cargo", "test", "--target", "thumbv7em-none-eabihf", "--", "--nocapture"]
+# FIX: the old CMD was
+#   cargo test --target thumbv7em-none-eabihf -- --nocapture
+# With no `--features qemu`, cargo compiled the REAL-HARDWARE test module
+# (`#[cfg(not(feature = "qemu"))]`), whose setup() calls the genuine HAL
+# `RccExt::freeze()`. QEMU's netduinoplus2 (an STM32F405 model) never raises the
+# RCC clock-ready bits, so freeze() spun forever -> the container "ran tests but
+# never responded."
+#
+# `cargo qemu` (alias in .cargo/config.toml) forces `--features qemu` AND
+# overrides the default probe-rs runner back to QEMU, so the container always
+# runs the register-spoofed path and can never reach the hanging one.
+CMD ["cargo", "qemu", "--", "--nocapture"]
