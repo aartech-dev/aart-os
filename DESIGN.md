@@ -360,6 +360,105 @@ thumbv7em-none-eabihf` (debug and release) against the real `stm32g474`
 feature, which catches pin/AF/ADC-channel mistakes at compile time even
 without Renode or real hardware.
 
+### 6.5 Power-stage reference circuit (adapted from RemoraNSR3.0)
+
+§6.1's ESCape32 wiki table only ever covered the **MCU-side pinout** —
+which GPIO does which job. It says nothing about the actual power
+electronics: gate driver, FETs, gate-supply generation, reverse-battery
+protection. For that, this section cross-references a real, built
+single-motor ESC board's schematic —
+[aartech-dev/RemoraNSR3.0](https://github.com/aartech-dev/RemoraNSR3.0/tree/main/kicad)
+— read directly from its KiCad `.kicad_sch` files and fabrication netlist
+(`kicad/production/netlist.ipc`), not just its rendered image, so the
+part numbers and net-level topology below are traceable to source rather
+than guessed from a picture.
+
+**What RemoraNSR3.0 actually uses** (single motor):
+
+| Function | Part | Ref | Notes |
+|---|---|---|---|
+| MCU | AT32F421G8U7 | U3 | Artery, pin/peripheral-compatible with STM32F0/G0-family 32-pin parts — a different MCU family from our STM32G474, but the same BEMF/virtual-neutral philosophy (see below) |
+| 3-phase gate driver | **TI DRV8300D** | U4 | QFN-24EP. `HIN1-3`/`LIN1-3` inputs (named `UH/VH/WH`/`UL/VL/WL` in the schematic), `HO1-3`/`LO1-3` gate outputs, `VB1-3` bootstrap caps + `VS1-3` phase-return per leg, one `GVDD` gate-supply pin, `MODE`/`DT` (external dead-time resistor) pins. No SPI, no integrated current-sense amplifier. |
+| Bridge FETs (×6) | **TI CSD16327Q3** | Q3–Q8 | 30V N-channel, SON 3.3×3.3mm. Confirmed from the netlist: Q3/Q5/Q7 drains land on the raw `VBUS` rail (high-side), Q4/Q6/Q8 drains land on the U/V/W phase nodes (low-side) — one high+low pair per leg, gated by the DRV8300D's `HOx`/`LOx` outputs. |
+| Boost regulator | **Diodes AP3012** | U1 | Adjustable-output boost (external inductor `L1`, rectifier diode `D3`, FB divider). Confirmed: `D3`'s cathode is the `VCC` net, and `VCC` is what feeds the DRV8300D's `GVDD` pin — i.e. **the gate driver's supply is boosted, not taken directly off the battery/track rail**, so full gate enhancement is guaranteed even when the raw supply sags under load. |
+| Logic LDO | AP2204K-3.3 | U2 | Fixed 3.3V LDO, `VIN` tied to the *boosted* `VCC` rail (not raw `VBUS`) — the MCU's 3.3V rail rides on top of the same boost that feeds the gate driver, rather than being a separate regulator off the raw input. |
+| Reverse-polarity protection | **CSD16327Q3 (Q1)** + BAT40V Schottky (D1/D2) + small-signal transistors (DTC143Z, a small N-FET, a dual NPN/PNP pair, a PNP) | Q1, Q2, Q9–Q11, D1, D2 | A series power MOSFET, not a plain series diode — much lower conduction loss at this current than a diode-based scheme. The exact discrete self-bias network (how Q1's gate gets charged/held on) wasn't fully re-traceable from the flat netlist alone — confirmed fact is that a MOSFET, not a diode, carries the reverse-protection current; the discrete bias details would need the rendered schematic to pin down exactly. |
+| Debug header | 6-pin connector | J1 | `VCC`/`VDD`/`GND` + 3 more (SWD-shaped) |
+
+**Adapting this to our 2-motor front/rear layout**: the sensible split is
+a **shared input/power-conditioning front end** feeding **two independent
+per-motor driver+bridge stages** — duplicating the whole front end per
+motor would double cost/board area for no benefit, since there's exactly
+one power source (track/battery) for the whole car:
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │   SHARED (one power source, one car)     │
+                    │                                           │
+  track/battery ──► │  reverse-polarity protection              │
+  in                │  (CSD16327Q3 + BAT40V, "ideal diode")     │
+                    │        │                                  │
+                    │        ▼  VBUS (raw, unregulated)         │
+                    │        ├──────────────► to both bridges'  │
+                    │        │                 high-side drains │
+                    │        ▼                                  │
+                    │  AP3012 boost ──► VCC (boosted gate-supply)│
+                    │        │              │                   │
+                    │        │              ├──► DRV8300D #1 GVDD│
+                    │        │              └──► DRV8300D #2 GVDD│
+                    │        ▼                                  │
+                    │  AP2204K-3.3 LDO ──► VDD (3.3V)            │
+                    │        └──────────────► STM32G474 + logic │
+                    └─────────────────────────────────────────┘
+                             │                        │
+                             ▼                        ▼
+              ┌─────────────────────────┐  ┌─────────────────────────┐
+              │  MOTOR A (front axle)   │  │  MOTOR B (rear axle)    │
+              │  DRV8300D #1            │  │  DRV8300D #2            │
+              │  HIN1-3/LIN1-3 ◄─ TIM1  │  │  HIN1-3/LIN1-3 ◄─ TIM8  │
+              │  6× CSD16327Q3 bridge   │  │  6× CSD16327Q3 bridge   │
+              │  U/V/W ──► motor A      │  │  U/V/W ──► motor B      │
+              │  virtual-neutral divider│  │  virtual-neutral divider│
+              │  ──► ADC1 (phase) +     │  │  ──► ADC2 (phase) +     │
+              │      ADC3 (neutral)     │  │      ADC4 (neutral)     │
+              └─────────────────────────┘  └─────────────────────────┘
+```
+
+This maps directly onto what's already implemented, not just onto a new
+design:
+
+- Each `DRV8300D`'s `HIN1-3`/`LIN1-3` inputs are exactly what `motor.rs`'s
+  `Bridge` already drives — TIM1's/TIM8's complementary PWM channels, one
+  driver per motor, no change needed to the timer wiring in §6.1.
+- Each `DRV8300D`'s phase-node virtual-neutral BEMF divider (their
+  `UE`/`VE`/`WE`/`Eref` nets) is the same *concept* as our own per-motor
+  virtual-neutral resistor node (§6.1 option 2, PB1/PB14) feeding the
+  dedicated ADC3/ADC4 (§6.4) — this reference design independently
+  arrived at the same sensing architecture we already built, which is a
+  useful cross-check, not a new requirement.
+- `DRV8300D` has no integrated current-sense amplifier, matching our own
+  discrete current-sense pins (PB11/PF1, §6.1) rather than requiring a
+  driver-side current-sense feature we'd have to newly support.
+- One `AP3012` + one `AP2204K-3.3` is enough for both motors — GVDD and
+  the 3.3V logic rail aren't per-motor concerns, so this doesn't scale
+  with motor count.
+- The reverse-polarity protection stage is sized once, for the combined
+  current of both bridges, not duplicated per motor.
+
+**What does scale with motor count**: two full `DRV8300D` + 6×
+`CSD16327Q3` bridges (12 FETs total), two sets of bootstrap capacitors
+(3 per driver), and two virtual-neutral divider networks — this is the
+real per-motor BOM cost of the front/rear layout, and it's linear, not
+quadratic, in motor count.
+
+**Not yet done**: this section documents the *reference* circuit and how
+it maps onto our pin/driver architecture — there is no schematic/PCB for
+this project yet, only `aart-core`/`stm32_os` firmware targeting the
+Nucleo-G474RE dev board. Turning this into an actual board (values for
+the boost's inductor/FB divider, the bootstrap caps, the reverse-FET's
+bias network, and the current-sense shunt) is real EE work this document
+doesn't attempt to finish here.
+
 ## 7. Application modules (all in `aart-core`, hardware-agnostic)
 
 ### 7.1 Commutator (per motor)
