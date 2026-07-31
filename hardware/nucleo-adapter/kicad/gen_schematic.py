@@ -94,8 +94,32 @@ UNIT_OF_PIN = {
 
 sch_symbols = []   # placement sexp text
 sch_labels = []    # global_label sexp text
+sch_wires = []     # short pin->label stub wires (see place(), STUB_LEN)
+sch_no_connects = []  # explicit no_connect markers for genuinely-unused pins
 ref_counters = {}
 pwr_counter = [0]
+
+# Extra length (mm) each pin grows by via a short stub wire before a label
+# lands on it. Densely-pinned parts (AP3012, DRV8300D, CSD16327Q3, etc.)
+# have several pins within a few mm of each other on the symbol body itself;
+# placing a global_label directly on the raw pin tip crowds its text into
+# neighboring pins/labels. Extending every pin outward (away from the
+# symbol's own center, same direction the pin already points) by a fixed
+# stub before the label lands there gives the label room without changing
+# connectivity - the wire segment is zero-impedance, same net either way.
+STUB_LEN = 6.0
+
+
+def wire(x1, y1, x2, y2):
+    sch_wires.append(
+        "\n".join([
+            "\t(wire",
+            f"\t\t(pts (xy {x1:.2f} {y1:.2f}) (xy {x2:.2f} {y2:.2f}))",
+            "\t\t(stroke (width 0) (type default))",
+            f'\t\t(uuid "{u()}")',
+            "\t)",
+        ])
+    )
 
 
 def next_ref(prefix):
@@ -103,15 +127,15 @@ def next_ref(prefix):
     return f"{prefix}{ref_counters[prefix]}"
 
 
-def place(lib_id, x, y, rotation=0, ref=None, ref_prefix="U", value=None, footprint_override=None, unit=1):
+def place(lib_id, x, y, rotation=0, ref=None, ref_prefix="U", value=None, footprint_override=None, unit=1, no_connect=()):
     """Places one symbol instance; returns {pin_number: (abs_x, abs_y)}."""
     if ref is None:
         ref = next_ref(ref_prefix)
     sym_uuid = u()
     props = []
-    props.append(f'\t\t(property "Reference" "{ref}" (at {x+5:.2f} {y:.2f} 0) (effects (font (size 1.27 1.27))))')
+    props.append(f'\t\t(property "Reference" "{ref}" (at {x+6:.2f} {y-3:.2f} 0) (effects (font (size 1.27 1.27))))')
     if value:
-        props.append(f'\t\t(property "Value" "{value}" (at {x+5:.2f} {y+2:.2f} 0) (effects (font (size 1.27 1.27))))')
+        props.append(f'\t\t(property "Value" "{value}" (at {x+6:.2f} {y+3:.2f} 0) (effects (font (size 1.27 1.27))))')
     if footprint_override is not None:
         props.append(f'\t\t(property "Footprint" "{footprint_override}" (at {x:.2f} {y:.2f} 0) (effects (font (size 1.27 1.27)) (hide yes)))')
     pins = PINS[lib_id]
@@ -146,6 +170,15 @@ def place(lib_id, x, y, rotation=0, ref=None, ref_prefix="U", value=None, footpr
     sch_symbols.append("\n".join(text))
 
     for num, (dx, dy, _prot) in pins.items():
+        # Skip pins belonging to a *different* unit than the one actually
+        # being placed here (mirrors the pin_lines filter above) - without
+        # this, a multi-unit part placed as e.g. unit=2 would still compute
+        # a stub wire/label point for unit=1/3's pins using unit=2's own
+        # (x,y) center, producing a wire connected to nothing at either end
+        # (confirmed: this is exactly what caused MCP6002's shared V+/V-
+        # pins to get spurious extra stubs when placing its unit=2 half).
+        if unit_map.get(num, 1) != unit:
+            continue
         rdx, rdy = rot(dx, dy, rotation)
         # KiCad symbol libraries author pin (dx,dy) in a Y-up local frame,
         # but the schematic sheet is Y-down - the rotated offset gets
@@ -154,7 +187,25 @@ def place(lib_id, x, y, rotation=0, ref=None, ref_prefix="U", value=None, footpr
         # (x+rdx, y-rdy), not (x+rdx, y+rdy), for every placement where
         # rdy != 0 (rotation=0 placements with nonzero pin dy exposed this;
         # rotation=90 passives masked it since their rdy is always 0).
-        abs_coords[num] = (x + rdx, y - rdy)
+        ox, oy = rdx, -rdy
+        px, py = x + ox, y + oy
+        if num in no_connect:
+            # Genuinely-unused pin (e.g. an IC's NC pin) - a proper
+            # no_connect marker at the raw pin tip, not a stub wire to
+            # nowhere (which ERC correctly flags as wire_dangling).
+            sch_no_connects.append(
+                f'\t(no_connect (at {px:.2f} {py:.2f}) (uuid "{u()}"))'
+            )
+            abs_coords[num] = (px, py)
+            continue
+        mag = math.hypot(ox, oy)
+        if mag > 0.01:
+            scale = (mag + STUB_LEN) / mag
+            sx, sy = x + ox * scale, y + oy * scale
+            wire(px, py, sx, sy)
+            abs_coords[num] = (sx, sy)
+        else:
+            abs_coords[num] = (px, py)
     return ref, abs_coords
 
 
@@ -204,87 +255,88 @@ def net(name, *points):
 # never fully reverse-engineered) - this is a standard, well-understood
 # textbook topology instead, chosen for correctness confidence over blind
 # replication.
-_, j1 = place("Connector_Generic:Conn_01x01", 20, 100, ref_prefix="J", value="Track +")
-_, j2 = place("Connector_Generic:Conn_01x01", 20, 90, ref_prefix="J", value="Track -")
+_, j1 = place("Connector_Generic:Conn_01x01", 20, 160, ref_prefix="J", value="Track +")
+_, j2 = place("Connector_Generic:Conn_01x01", 20, 120, ref_prefix="J", value="Track -")
 net("TRACK_PWR", j1["1"])
 net("TRACK_RTN_RAW", j2["1"])
+pwr_flag(20, 175)
+net("TRACK_PWR", (20, 175))
 
-_, q1 = place("AdapterSymbols:CSD16327Q3", 45, 90, ref_prefix="Q", value="CSD16327Q3")
+_, q1 = place("AdapterSymbols:CSD16327Q3", 65, 120, ref_prefix="Q", value="CSD16327Q3")
 net("TRACK_RTN_RAW", q1["5"])  # D
 net("GND", q1["1"])            # S (x3 pins, same coordinate)
 net("RP_GATE", q1["4"])        # G
 
-_, r1 = place("Device:R", 45, 105, rotation=90, ref_prefix="R", value="10k")
+_, r1 = place("Device:R", 65, 155, rotation=90, ref_prefix="R", value="10k")
 net("TRACK_PWR", r1["1"])
 net("RP_GATE", r1["2"])
 
-_, d1 = place("AdapterSymbols:D_Zener_Small", 55, 95, ref_prefix="D", value="15V")
+_, d1 = place("AdapterSymbols:D_Zener_Small", 95, 135, ref_prefix="D", value="15V")
 net("RP_GATE", d1["1"])  # K
 net("GND", d1["2"])      # A
 
-net("TRACK_PWR", (20, 100))  # VBUS = TRACK_PWR directly (unprotected side - see module doc)
-label("VBUS", 20, 100)
-label("VBUS", 45, 78)  # bus tap point, feeds boost + both bridges' high-side drains
+net("TRACK_PWR", (20, 160))  # VBUS = TRACK_PWR directly (unprotected side - see module doc)
+label("VBUS", 20, 160)
 
 # --- Boost regulator: VBUS -> VCC (boosted gate-drive supply), ~12V target ---
 # AP3012 adjustable boost. R2/R3 set the FB divider - placeholder values
 # targeting ~12V assuming a ~1.25V FB reference; verify against the AP3012
 # datasheet's actual reference voltage before board bring-up. L1/D2/C1/C2
 # values are likewise placeholders pending real characterization.
-_, u1 = place("AdapterSymbols:AP3012", 90, 100, ref_prefix="U", value="AP3012")
+_, u1 = place("AdapterSymbols:AP3012", 140, 150, ref_prefix="U", value="AP3012")
 net("VBUS", u1["5"])   # IN
 net("VBUS", u1["4"])   # ~SHDN tied to IN - always enabled (matches RemoraNSR3.0's own wiring)
 net("GND", u1["2"])    # GND
-gnd_pt = gnd(90, 115)  # real power:GND symbol - for schematic readability
+gnd_pt = gnd(140, 175)  # real power:GND symbol - for schematic readability
 net("GND", gnd_pt)
-_gnd_flag = pwr_flag(90, 122)  # power:GND's own pin is power_in, not power_out - still needs a PWR_FLAG
-net("GND", (90, 122))
+_gnd_flag = pwr_flag(140, 190)  # power:GND's own pin is power_in, not power_out - still needs a PWR_FLAG
+net("GND", (140, 190))
 
-_, l1 = place("Device:L", 75, 108, rotation=90, ref_prefix="L", value="10uH")
+_, l1 = place("Device:L", 110, 165, rotation=90, ref_prefix="L", value="10uH")
 net("VBUS", l1["1"])
 net("AP3012_SW", l1["2"])
 net("AP3012_SW", u1["1"])  # SW
 
-_, d2 = place("Device:D", 105, 108, ref_prefix="D", value="Schottky (e.g. SS14)")
+_, d2 = place("Device:D", 165, 165, ref_prefix="D", value="Schottky (e.g. SS14)")
 # Device:D pin "1" = K (cathode), pin "2" = A (anode) - a boost rectifier
 # conducts switch-node -> VCC, i.e. anode at the switch node, cathode at VCC.
 net("AP3012_SW", d2["2"])  # A
 net("VCC", d2["1"])        # K
 
-_, c1 = place("Device:C", 90, 85, rotation=90, ref_prefix="C", value="10uF")
+_, c1 = place("Device:C", 140, 115, rotation=90, ref_prefix="C", value="10uF")
 net("VBUS", c1["1"])
 net("GND", c1["2"])
 
-_, c2 = place("Device:C", 115, 100, rotation=90, ref_prefix="C", value="22uF")
+_, c2 = place("Device:C", 190, 150, rotation=90, ref_prefix="C", value="22uF")
 net("VCC", c2["1"])
 net("GND", c2["2"])
 
-_, r2 = place("Device:R", 125, 108, rotation=90, ref_prefix="R", value="86k")
+_, r2 = place("Device:R", 210, 165, rotation=90, ref_prefix="R", value="86k")
 net("VCC", r2["1"])
 net("AP3012_FB", r2["2"])
 net("AP3012_FB", u1["3"])  # FB
 
-_, r3 = place("Device:R", 125, 95, rotation=90, ref_prefix="R", value="10k")
+_, r3 = place("Device:R", 210, 130, rotation=90, ref_prefix="R", value="10k")
 net("AP3012_FB", r3["1"])
 net("GND", r3["2"])
 
 # VCC bus-tap label deliberately omitted here - it'll be added by task #20
 # wiring directly to each DRV8300D's GVDD pin, once those are placed.
-_vcc_flag = pwr_flag(90, 70)  # boost output isn't power_out-typed per ERC (SW/diode pins are passive)
-net("VCC", (90, 70))
+_vcc_flag = pwr_flag(140, 100)  # boost output isn't power_out-typed per ERC (SW/diode pins are passive)
+net("VCC", (140, 100))
 
 # --- Logic LDO: VCC -> VDD (3.3V, matches the Nucleo's own logic rail) ---
-_, u2 = place("AdapterSymbols:AP2204K-3.3", 145, 100, ref_prefix="U", value="AP2204K-3.3")
+_, u2 = place("AdapterSymbols:AP2204K-3.3", 240, 150, ref_prefix="U", value="AP2204K-3.3", no_connect={"4"})
 net("VCC", u2["1"])   # VIN
 net("VCC", u2["3"])   # EN tied on
 net("GND", u2["2"])   # GND
 net("VDD", u2["5"])   # VOUT
 
-_, c3 = place("Device:C", 135, 85, rotation=90, ref_prefix="C", value="1uF")
+_, c3 = place("Device:C", 220, 115, rotation=90, ref_prefix="C", value="1uF")
 net("VCC", c3["1"])
 net("GND", c3["2"])
 
-_, c4 = place("Device:C", 160, 85, rotation=90, ref_prefix="C", value="1uF")
+_, c4 = place("Device:C", 260, 115, rotation=90, ref_prefix="C", value="1uF")
 net("VDD", c4["1"])
 net("GND", c4["2"])
 
@@ -297,61 +349,60 @@ net("GND", c4["2"])
 # is a 4-resistor difference amp centered on it - chosen over betting on an
 # unfamiliar bidirectional current-sense IC (see commit notes). Output net
 # PA2 matches the real GPIO this feeds (DESIGN.md 6.1/6.5).
-_, r_shunt = place("Device:R", 45, 78, rotation=90, ref_prefix="R", value="5mOhm 1W")
+_, r_shunt = place("Device:R", 65, 90, rotation=90, ref_prefix="R", value="5mOhm 1W")
 net("VBUS", r_shunt["1"])
-net("VBUS_SHUNT", r_shunt["2"])
-label("VBUS_LOAD", 45, 78)  # continues on to both bridges' high-side drains past the shunt
+# VBUS_LOAD (not VBUS) is what both bridges' high-side drains actually
+# connect to (see motor_block below) - the shunt must sit in series
+# between the raw input and the bridges for the sense amp to see real
+# load current, per DESIGN.md 6.5 ("shunt on the main input path ...
+# before it splits to the two bridges"). A stray duplicate net name here
+# previously left the bridges tied to raw VBUS, bypassing the shunt
+# entirely - fixed alongside this layout pass since it was found while
+# untangling an overlapping label at this exact point.
 net("VBUS_LOAD", r_shunt["2"])
 
-_, r4 = place("Device:R", 165, 108, rotation=90, ref_prefix="R", value="10k")
+_, r4 = place("Device:R", 310, 165, rotation=90, ref_prefix="R", value="10k")
 net("VDD", r4["1"])
 net("VDD_HALF_RAW", r4["2"])
-_, r5 = place("Device:R", 165, 95, rotation=90, ref_prefix="R", value="10k")
+_, r5 = place("Device:R", 310, 130, rotation=90, ref_prefix="R", value="10k")
 net("VDD_HALF_RAW", r5["1"])
 net("GND", r5["2"])
 
-u3_ref, u3 = place("Amplifier_Operational:LM2904", 185, 100, ref_prefix="U", value="MCP6002-xSN", unit=1)
+u3_ref, u3 = place("Amplifier_Operational:LM2904", 345, 150, ref_prefix="U", value="MCP6002-xSN", unit=1)
 net("VDD_HALF_RAW", u3["3"])   # unit A: IN1+ = raw divider midpoint
 net("VDD_HALF", u3["2"])       # unit A: IN1- fed back from OUT1 (voltage follower)
 net("VDD_HALF", u3["1"])       # unit A: OUT1 = buffered VDD/2 reference
 
-_, u3pwr = place("Amplifier_Operational:LM2904", 185, 100, ref=u3_ref, unit=3)  # shared power pins
+_, u3pwr = place("Amplifier_Operational:LM2904", 345, 150, ref=u3_ref, unit=3)  # shared power pins
 net("GND", u3pwr["4"])  # V-
 net("VDD", u3pwr["8"])  # V+
 
-_, u3b = place("Amplifier_Operational:LM2904", 210, 100, ref=u3_ref, value=None, unit=2)
-_, r6 = place("Device:R", 200, 108, rotation=90, ref_prefix="R", value="1k")
+_, u3b = place("Amplifier_Operational:LM2904", 400, 150, ref=u3_ref, value=None, unit=2)
+_, r6 = place("Device:R", 380, 165, rotation=90, ref_prefix="R", value="1k")
 net("VBUS", r6["1"])
 net("DIFF_IN_PLUS", r6["2"])
 net("DIFF_IN_PLUS", u3b["5"])  # unit B: IN2+
 
-_, r7 = place("Device:R", 200, 95, rotation=90, ref_prefix="R", value="1k")
-net("VBUS_SHUNT", r7["1"])
+_, r7 = place("Device:R", 380, 130, rotation=90, ref_prefix="R", value="1k")
+net("VBUS_LOAD", r7["1"])
 net("DIFF_IN_MINUS", r7["2"])
 net("DIFF_IN_MINUS", u3b["6"])  # unit B: IN2-
 
-_, r8 = place("Device:R", 220, 108, rotation=90, ref_prefix="R", value="20k")
+_, r8 = place("Device:R", 425, 165, rotation=90, ref_prefix="R", value="20k")
 net("DIFF_IN_PLUS", r8["1"])
 net("VDD_HALF", r8["2"])
 
-_, r9 = place("Device:R", 220, 95, rotation=90, ref_prefix="R", value="20k")
+_, r9 = place("Device:R", 425, 130, rotation=90, ref_prefix="R", value="20k")
 net("DIFF_IN_MINUS", r9["1"])
 net("PA2", r9["2"])
 net("PA2", u3b["7"])  # unit B: OUT2 = ADC1 channel 3, shared track-current sense
 
-# PWR_FLAG so ERC doesn't flag TRACK_PWR/VBUS as "power input not driven" -
-# it's an externally-sourced supply (raw track power), not something this
-# sheet generates. VDD/VCC's PWR_FLAGs (or, for VDD, its real LDO driver)
-# are placed above, next to their respective source components.
-pwr_flag(20, 105)
-net("TRACK_PWR", (20, 105))
-
 # --- Shared bus-voltage sense (DESIGN.md 6.1: PB12, "one reading is
 # enough" - not per-motor, just a plain divider off VBUS) ---
-_, rv1 = place("Device:R", 45, 60, rotation=90, ref_prefix="R", value="47k")
+_, rv1 = place("Device:R", 65, 60, rotation=90, ref_prefix="R", value="47k")
 net("VBUS", rv1["1"])
 net("PB12", rv1["2"])
-_, rv2 = place("Device:R", 45, 50, rotation=90, ref_prefix="R", value="10k")
+_, rv2 = place("Device:R", 65, 40, rotation=90, ref_prefix="R", value="10k")
 net("PB12", rv2["1"])
 net("GND", rv2["2"])
 
@@ -369,7 +420,7 @@ net("GND", rv2["2"])
 
 def motor_block(suffix, ox, oy, hin, lin, bemf, neutral_net, curr_net):
     """hin/lin/bemf are each a 3-tuple of net names for phases U,V,W."""
-    _, drv = place("AdapterSymbols:DRV8300D", ox, oy, ref_prefix="U", value=f"DRV8300D (motor {suffix})")
+    _, drv = place("AdapterSymbols:DRV8300D", ox, oy, ref_prefix="U", value=f"DRV8300D ({suffix})", no_connect={"7", "8"})
     net("VCC", drv["4"])   # GVDD - boosted gate supply, shared
     net("GND", drv["6"])   # GND
     net("GND", drv["25"])  # PAD (thermal, tie to GND)
@@ -389,7 +440,7 @@ def motor_block(suffix, ox, oy, hin, lin, bemf, neutral_net, curr_net):
     # physical board this single-sheet schematic doesn't model. See the
     # commit notes / README for this documented exclusion.
     for idx, (name, net_name) in enumerate(zip(("HIN1", "HIN2", "HIN3", "LIN1", "LIN2", "LIN3"), hin + lin)):
-        _, jn = place("Connector_Generic:Conn_01x01", ox - 70, oy + 25 - 8 * idx,
+        _, jn = place("Connector_Generic:Conn_01x01", ox - 110, oy + 40 - 15 * idx,
                       ref_prefix="J", value=f"Nucleo {net_name} ({name}, motor {suffix})")
         net(net_name, jn["1"])
 
@@ -397,11 +448,11 @@ def motor_block(suffix, ox, oy, hin, lin, bemf, neutral_net, curr_net):
     # placeholder; DESIGN.md flags this needs datasheet verification before
     # board bring-up (both pins likely want a specific resistor-to-GND value
     # to select PWM mode / set dead time, not just "some pulldown").
-    _, r_mode = place("Device:R", ox - 40, oy + 15, rotation=90, ref_prefix="R", value="10k (verify vs datasheet)")
+    _, r_mode = place("Device:R", ox - 55, oy + 20, rotation=90, ref_prefix="R", value="10k (verify vs datasheet)")
     net(f"DRVMODE_{suffix}", r_mode["1"])
     net(f"DRVMODE_{suffix}", drv["5"])   # MODE
     net("GND", r_mode["2"])
-    _, r_dt = place("Device:R", ox - 40, oy - 25, rotation=90, ref_prefix="R", value="10k (verify vs datasheet)")
+    _, r_dt = place("Device:R", ox - 55, oy - 35, rotation=90, ref_prefix="R", value="10k (verify vs datasheet)")
     net(f"DRVDT_{suffix}", r_dt["1"])
     net(f"DRVDT_{suffix}", drv["21"])    # DT
     net("GND", r_dt["2"])
@@ -415,53 +466,55 @@ def motor_block(suffix, ox, oy, hin, lin, bemf, neutral_net, curr_net):
     lo_pins = ("11", "10", "9")    # LO1,LO2,LO3
     vb_pins = ("20", "17", "14")   # VB1,VB2,VB3
     vs_pins = ("18", "15", "12")   # VS1,VS2,VS3
-    leg_dx = 60
+    leg_dx = 95
     for i, leg in enumerate(("U", "V", "W")):
-        lx = ox + 70
-        ly = oy + 60 - i * leg_dx
+        lx = ox + 90
+        ly = oy + 95 - i * leg_dx
         phase_net = f"PH_{leg}_{suffix}"
 
-        _, cb = place("Device:C", lx - 15, ly + 10, rotation=90, ref_prefix="C", value="100nF")
+        _, cb = place("Device:C", lx - 25, ly + 18, rotation=90, ref_prefix="C", value="100nF")
         net(f"VB{i+1}_{suffix}", cb["1"])
         net(f"VB{i+1}_{suffix}", drv[vb_pins[i]])
         net(phase_net, cb["2"])
         net(phase_net, drv[vs_pins[i]])
 
-        _, qh = place("AdapterSymbols:CSD16327Q3", lx, ly, ref_prefix="Q", value=f"CSD16327Q3 (high {leg}, motor {suffix})")
-        net("VBUS", qh["5"])       # D -> raw input rail (high-side)
+        _, qh = place("AdapterSymbols:CSD16327Q3", lx + 15, ly, ref_prefix="Q", value="CSD16327Q3")
+        net("VBUS_LOAD", qh["5"])  # D -> input rail, downstream of the shared shunt (high-side)
         net(phase_net, qh["1"])    # S -> phase node
-        _, rgh = place("Device:R", lx - 20, ly, rotation=90, ref_prefix="R", value="10R")
+        _, rgh = place("Device:R", lx - 32, ly, rotation=90, ref_prefix="R", value="10R")
         net(f"HO{i+1}_{suffix}", rgh["1"])
         net(f"HO{i+1}_{suffix}", drv[ho_pins[i]])
         net(f"HO{i+1}G_{suffix}", rgh["2"])
         net(f"HO{i+1}G_{suffix}", qh["4"])
 
-        _, ql = place("AdapterSymbols:CSD16327Q3", lx, ly - 15, ref_prefix="Q", value=f"CSD16327Q3 (low {leg}, motor {suffix})")
+        _, ql = place("AdapterSymbols:CSD16327Q3", lx + 15, ly - 25, ref_prefix="Q", value="CSD16327Q3")
         net(phase_net, ql["5"])          # D -> phase node
         net(f"MOTRTN_{suffix}", ql["1"])  # S -> common motor-return node
-        _, rgl = place("Device:R", lx - 20, ly - 15, rotation=90, ref_prefix="R", value="10R")
+        _, rgl = place("Device:R", lx - 32, ly - 25, rotation=90, ref_prefix="R", value="10R")
         net(f"LO{i+1}_{suffix}", rgl["1"])
         net(f"LO{i+1}_{suffix}", drv[lo_pins[i]])
         net(f"LO{i+1}G_{suffix}", rgl["2"])
         net(f"LO{i+1}G_{suffix}", ql["4"])
 
-        _, jph = place("Connector_Generic:Conn_01x01", lx + 30, ly - 7, ref_prefix="J", value=f"Motor {suffix} phase {leg}")
+        _, jph = place("Connector_Generic:Conn_01x01", lx + 55, ly - 12, ref_prefix="J", value=f"Motor {suffix} phase {leg}")
         net(phase_net, jph["1"])
 
-        _, rb1 = place("Device:R", lx + 45, ly, rotation=90, ref_prefix="R", value="47k")
+        _, rb1 = place("Device:R", lx + 80, ly, rotation=90, ref_prefix="R", value="47k")
         net(phase_net, rb1["1"])
         net(bemf[i], rb1["2"])
-        _, rb2 = place("Device:R", lx + 45, ly - 12, rotation=90, ref_prefix="R", value="10k")
+        _, rb2 = place("Device:R", lx + 80, ly - 20, rotation=90, ref_prefix="R", value="10k")
         net(bemf[i], rb2["1"])
         net("GND", rb2["2"])
 
         # Virtual-neutral summing tap (3x47k converging + 10k to GND,
-        # placed after the block below).
-        _, rn = place("Device:R", lx + 60, ly, rotation=90, ref_prefix="R", value="47k")
+        # placed after the block below). Offset down a row and given extra
+        # x-clearance from the BEMF divider so the two facing labels don't
+        # crowd each other.
+        _, rn = place("Device:R", lx + 140, ly - 10, rotation=90, ref_prefix="R", value="47k")
         net(phase_net, rn["1"])
         net(neutral_net, rn["2"])
 
-    _, rn_gnd = place("Device:R", ox + 145, oy - 40, rotation=90, ref_prefix="R", value="10k")
+    _, rn_gnd = place("Device:R", ox + 215, oy - 55, rotation=90, ref_prefix="R", value="10k")
     net(neutral_net, rn_gnd["1"])
     net("GND", rn_gnd["2"])
 
@@ -470,10 +523,10 @@ def motor_block(suffix, ox, oy, hin, lin, bemf, neutral_net, curr_net):
     # across it (base part INA180A1 placed directly, Value overridden to
     # the real gain-50 variant actually used - see the PINS-table comment
     # on why the derived symbol's own lib_id can't be placed directly).
-    _, r_shunt = place("Device:R", ox + 70, oy - 60, rotation=90, ref_prefix="R", value="5mOhm 1W")
+    _, r_shunt = place("Device:R", ox + 90, oy - 90, rotation=90, ref_prefix="R", value="5mOhm 1W")
     net(f"MOTRTN_{suffix}", r_shunt["1"])
     net("GND", r_shunt["2"])
-    _, ina = place("Amplifier_Current:INA180A1", ox + 100, oy - 60, ref_prefix="U", value="INA180A2")
+    _, ina = place("Amplifier_Current:INA180A1", ox + 130, oy - 90, ref_prefix="U", value="INA180A2")
     net(f"MOTRTN_{suffix}", ina["3"])  # IN+ (FET/shunt side)
     net("GND", ina["4"])               # IN- (true GND side of shunt)
     net("VDD", ina["5"])               # V+
@@ -483,14 +536,14 @@ def motor_block(suffix, ox, oy, hin, lin, bemf, neutral_net, curr_net):
 
 # Motor A: TIM1 / ADC1 / ADC3 (DESIGN.md 6.4)
 motor_block(
-    "A", 300, 140,
+    "A", 320, 340,
     hin=("PA8", "PA9", "PA10"), lin=("PA7", "PB0", "PF0"),
     bemf=("PA0", "PA1", "PA3"), neutral_net="PB1", curr_net="PB11",
 )
 
 # Motor B: TIM8 / ADC2 / ADC4 (DESIGN.md 6.4)
 motor_block(
-    "B", 300, 400,
+    "B", 320, 650,
     hin=("PA15", "PB8", "PB9"), lin=("PB3", "PB4", "PB5"),
     bemf=("PA4", "PA5", "PA6"), neutral_net="PB14", curr_net="PF1",
 )
@@ -639,11 +692,13 @@ output = "\n".join([
     "\t(generator \"eeschema\")",
     "\t(generator_version \"10.0\")",
     f'\t(uuid "{u()}")',
-    '\t(paper "A1")',
+    '\t(paper "A0")',
     "\t(lib_symbols",
     lib_symbols_block,
     "\t)",
     "\n".join(sch_symbols),
+    "\n".join(sch_wires),
+    "\n".join(sch_no_connects),
     "\n".join(sch_labels),
     "\t(sheet_instances",
     '\t\t(path "/"',

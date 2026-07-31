@@ -71,6 +71,29 @@ guessed from memory): TI DRV8300D (3-phase gate driver), TI CSD16327Q3
   a buffered VDD/2 reference — consistent with the firmware's existing
   `TRACK_CURRENT_ZERO_OFFSET` bidirectional-detection scheme.
 
+## Layout notes
+
+The sheet is A0 (the drawing spans ~470×410mm across the shared front end
+and two motor blocks — too big for A3/A1, which was silently clipping the
+second motor block from any page-bounded export until caught and fixed).
+Every pin gets a short stub wire before its label lands, rather than the
+label sitting directly on the pin tip — needed because several parts here
+(AP3012, DRV8300D, CSD16327Q3) have multiple pins within a few mm of each
+other, and a label glued straight to the pin crowds into neighboring
+pins/labels. `place()`'s `no_connect` parameter marks genuinely-unused
+pins (AP2204K-3.3's NC, DRV8300D's two NC pins) with a proper KiCad
+no-connect flag instead of leaving a stub wire dangling to nowhere.
+
+While untangling one such overlap (three labels stacked on the shared
+current-sense shunt), found and fixed a real topology bug: the comment
+already documented that the shunt must sit in series before the bridges
+split (DESIGN.md 6.5 — "before it splits to the two bridges"), but the
+bridges' high-side FET drains were wired to the pre-shunt `VBUS` net
+directly, bypassing the shunt entirely. Fixed by wiring the bridges to
+`VBUS_LOAD` (the shunt's downstream side) instead, so the shared
+current-sense amp actually sees load current now rather than a stray
+branch current.
+
 ## Known/accepted ERC findings
 
 `kicad-cli sch erc adapter.kicad_sch` reports **0 errors**. Two categories
