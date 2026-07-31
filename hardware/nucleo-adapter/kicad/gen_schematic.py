@@ -639,7 +639,7 @@ output = "\n".join([
     "\t(generator \"eeschema\")",
     "\t(generator_version \"10.0\")",
     f'\t(uuid "{u()}")',
-    '\t(paper "A3")',
+    '\t(paper "A1")',
     "\t(lib_symbols",
     lib_symbols_block,
     "\t)",
