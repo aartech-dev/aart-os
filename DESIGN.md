@@ -969,6 +969,24 @@ correctly and reject erased flash / truncated / bad-magic buffers.
 syntax and the `format_param`/`UnknownParam`-error wire formatting
 directly.
 
+**End-to-end wire-protocol test**: `aart-core/tests/uart_get_set_save.rs`
+(a Cargo integration test, run alongside the unit tests by plain
+`cargo test`) drives the exact same public functions `stm32_os/src/
+main.rs`'s command loop calls - `LineReader` fed one byte at a time
+(mimicking real UART delivery, including lines split across arbitrary
+chunk boundaries), `parse_line`, `params::get`/`set`, `format_param`/
+`format_error` - asserting the literal bytes an operator's terminal would
+see for `GET`/`SET`/`SAVE` sessions. This exists because neither QEMU nor
+Renode can currently exercise this path: `cargo qemu`'s test target
+doesn't cover `main.rs`'s command loop at all and reproducibly hangs on
+unrelated setup even for what it does cover (§4), and Renode has no ADC/
+UART interrupt model for this chip (§6.3). What it deliberately doesn't
+cover - `SAVE`'s real flash write and `apply_params`'s push into the live
+`Commutator`s - both touch hardware-only state (`stm32_os::config_store`,
+`main.rs`'s `MOTOR_A`/`MOTOR_B` statics) and need real hardware to verify;
+the test file's own header comment says so explicitly rather than
+implying more coverage than it has.
+
 **Not yet done / open questions**: the documented ranges above (freq_min/
 max's 20-150kHz in particular) are placeholders pending real bench tuning
 against actual 1106 motor/track characteristics, same caveat as every
