@@ -290,26 +290,59 @@ it arrives, same as was done for RCC.
 
 ### 7.1 Commutator (per motor)
 
+**Revised understanding (post-M5): these are small 1106 slot car motors,
+not RC/drone motors — there is no throttle input at all.** Track voltage
+(external to this system) is what controls speed. This device's job is
+just: sync each motor at power-on, then run it at ~100% duty ("no PWM")
+permanently once synced, using PWM only for the differential's cornering
+correction (see 7.3). The two-option-set decided in the M1/M2 planning
+(BEMF-only slip, per-motor virtual-neutral ADC) still stands; what changed
+is that "throttle" never meant a live speed command — see the open question
+this raised, below.
+
 State machine, one instance per motor:
-- **Inputs**: zero-cross event timestamps (tick or timer-capture units),
-  target duty (0.0–1.0), current tick.
+- **Inputs**: zero-cross event timestamps, current tick. No throttle
+  input — sync always ramps toward the same fixed `sync_target_erpm` every
+  time, a configured motor characteristic (where BEMF becomes reliably
+  detectable), not a per-run command.
 - **Output**: current step index (1–6), computed next-commutation deadline
-  (30° electrical after last zero-cross), PWM duty to apply.
-- **Startup**: open-loop ramp (fixed commutation rate, ramping duty/rate)
-  until BEMF is reliably detectable, then hand off to closed-loop
-  zero-cross timing — standard sensorless-ESC startup behavior, same shape
-  as ESCape32's.
+  (30° electrical after last zero-cross), duty to apply.
+- **Sync (open-loop)**: commanded electrical rate ramps from
+  `sync_start_erpm` to `sync_target_erpm` (rate configurable via
+  `sync_ramp_erpm_per_step`), duty ramping in lockstep from
+  `sync_start_duty` to `sync_max_duty` over the same range. Hands off to
+  closed-loop only once the target rate is reached *and* a real
+  zero-crossing has actually been measured (reaching the target rate alone
+  isn't sufficient — BEMF might genuinely not be visible yet at a
+  misconfigured target). If BEMF is never detected, sync holds at the
+  target rate/duty indefinitely rather than forcing a handoff blind.
+- **Running (closed-loop)**: duty pinned to `sync_max_duty` (~1.0, "no
+  PWM") as the baseline; the differential controller (7.3) is the only
+  thing that ever pulls it lower, per-motor, for cornering.
 - **Fault**: stall detection (no zero-cross within an expected window at
   the current commutation rate) → `Fault::Stall`.
+- **PWM switching frequency**: schedules 48kHz→96kHz linearly across an
+  eRPM range (`PwmFrequencySchedule`, driven by `current_erpm()` — a
+  best-effort speed estimate that's live throughout sync, unlike the
+  stricter `electrical_rpm()` which stays `None` until BEMF is trusted).
+  Applying this at runtime needs the timer's PSC/ARR rewritten directly
+  (`Bridge::set_frequency_hz` in `stm32_os`), since `pwm_advanced()`'s
+  builder only sets frequency once, before `.finalize()`.
+
+**Known gap**: all of sync's eRPM/duty/ramp-rate numbers, and the PWM
+frequency schedule's eRPM bounds, are placeholders pending real bench/track
+tuning against actual 1106 motor characteristics (see `main.rs`'s
+`motor_commutator_config`/`pwm_frequency_schedule`) — none of this was
+derived from real motor data, just reasonable-order-of-magnitude guesses.
 
 Host-tested by feeding synthetic zero-cross timestamp sequences (steady
-RPM, accelerating, a dropped zero-cross, a stall) and asserting step
-sequencing, timing, and fault transitions — no hardware needed.
+RPM, accelerating, a dropped zero-cross, a stall, never-hands-off-without-
+trusted-BEMF) and asserting step sequencing, timing, and fault
+transitions — no hardware needed.
 
 ### 7.2 UART command/telemetry protocol
 
-Simple line-based text protocol (bench-friendly, matches your chosen UART
-option):
+Simple line-based text protocol (bench-friendly):
 
 ```
 > THR 0.35
@@ -319,18 +352,29 @@ option):
 
 Parsing/formatting is pure logic in `aart-core::protocol`, host-tested for
 malformed input, out-of-range values, partial/split reads across buffer
-boundaries. `stm32_os` only does byte I/O against USART2.
+boundaries. `stm32_os` does byte I/O against USART1 (PB6/PB7 — see 6.2,
+*not* USART2/the ST-Link VCOM pins).
+
+`THR` is still parsed and range-validated (useful for bench testing without
+a real track/motors) but is a deliberate no-op on real hardware — see 7.1,
+there's no throttle input for it to drive. `STEER` is the only command that
+actually changes anything once a motor is Running.
 
 ### 7.3 Electronic differential + slip estimate
 
-**Inputs**: `throttle_cmd`, `steer_cmd` (from the UART protocol),
-`erpm_a`/`erpm_b` (from each `Commutator`, i.e. **electrical speed derived
-from BEMF timing, not a ground-truth wheel speed** — this was the chosen
-starting point, see the note below).
+**Inputs**: `base_duty` (in practice always `sync_max_duty`, i.e. ~1.0 —
+there's no throttle command to vary it, see 7.1; kept as a parameter so
+this module doesn't need to know that convention and bench tests can still
+drive it directly), `steer_cmd` (from the UART protocol), `erpm_a`/`erpm_b`
+(from each `Commutator`, i.e. **electrical speed derived from BEMF timing,
+not a ground-truth wheel speed** — this was the chosen starting point, see
+the note below).
 
 **Output**: `target_duty_a`, `target_duty_b` — a skid-steer-style split,
-where `steer_cmd` biases one side down and the other up from
-`throttle_cmd`.
+where `steer_cmd` biases one side down and the other up from `base_duty`.
+Going straight at `base_duty ≈ 1.0`, this is what "no PWM once running"
+actually reduces to: both sides at ~100%, PWM (a duty below that) only
+ever appearing on whichever side a corner is biasing down.
 
 **Slip estimate**: since there's no independent wheel-speed sensor,
 `slip_estimate = normalize(erpm_a, erpm_b) − expected_ratio(steer_cmd)`.
@@ -359,7 +403,7 @@ lands in.
 | # | Milestone | Test tier(s) |
 |---|---|---|
 | M0 | Workspace split (`aart-core` + `stm32_os`); cyclic executive scheduler; SysTick @ 1kHz drives it; LED-blink task replaces `loop {}` | 1 (scheduler logic) + 2 (Renode: SysTick fires, GPIOA toggles — extends existing `hal_test.rs`) |
-| M1 | PWM (TIM1/TIM8), ADC (ADC1/ADC2 w/ TRGO), USART2 drivers behind traits | 2 (Renode `.repl`/shim extension — register-level correctness) |
+| M1 | PWM (TIM1/TIM8), ADC (ADC1/ADC2 w/ TRGO), USART1 drivers behind traits | 2 (Renode `.repl`/shim extension — register-level correctness) |
 | M2 | `Commutator` for motor A: startup ramp, zero-cross tracking, six-step sequencing, stall detection | 1 (majority of test coverage) + 2 (PWM registers get written) |
 | M3 | Second `Commutator` instance for motor B (independent, no shared state) | 1 (independence) + 2 |
 | M4 | UART protocol: `THR`/`STEER` in, `SPD ... OK`/`ERR ...` out | 1 (parser) + 2 (bytes in/out via Renode UART) |
@@ -369,6 +413,113 @@ lands in.
 Recommended order: M0 → M1 → M2 → M3 → M4 → M5 → M6. M2/M3 and M4 could be
 swapped or parallelized once M1 lands, since they don't depend on each
 other.
+
+**Post-M5 addendum**: once M5 landed, it turned out the throttle-based
+model M2–M5 were built against didn't match the real target hardware —
+see the revised 7.1/7.3. Reworked before M6: `Commutator`'s sync ramp is
+now eRPM-range-based (not step-count-based) targeting a fixed
+`sync_target_erpm`, `Bridge` gained `set_frequency_hz` for the 48→96kHz PWM
+switching-frequency schedule, and `DiffController`'s first parameter is
+`base_duty` rather than a throttle command. M1's original PWM/ADC driver
+work and M2/M3's commutation-loop wiring didn't need to change shape, only
+the numbers/duty-source feeding them.
+
+**M6 addendum**: `aart-core::fault::FaultSupervisor` aggregates overcurrent
+(per-motor raw ADC sample vs. a configured limit), stall (passed in from
+each `Commutator::phase()`, not duplicated), and UART comms-loss (a timeout
+since the last successfully parsed line, of either command — not just
+`STEER` — since comms-loss is about whether the link is alive at all) into
+one `FaultStatus`, host-tested for each fault independently plus the
+timeout's edges. `all_healthy()` is the single bit that gates the IWDG feed
+in `stm32_os`, exactly as this table originally specified. Wiring this up
+surfaced a real bug in the M2-era stall handling: `apply_step(..., 0)` on a
+stalled motor left two phases actively driven low (chopped to 0% duty,
+which is *not* the same as off) rather than truly disabled — fixed by
+calling `Bridge::disable()` (true Hi-Z on all three phases) instead,
+finally giving `disable()` its first real caller. Overcurrent gets the same
+`disable()` treatment, applied every tick the condition persists (simpler
+than edge-detecting when it first trips). Comms-loss resets `steer_cmd` to
+0 (fail-safe straight) rather than disabling anything, since losing the
+steering link isn't itself a hardware safety issue for a motor that's
+otherwise running fine. `IndependentWatchdog` (already implemented in
+stm32g4xx-hal, not hand-rolled) is fed once per outer loop iteration only
+when `all_healthy()` — a persistent, uncorrected fault eventually resets
+the whole MCU as a last-resort recovery path, on top of (not instead of)
+the immediate per-fault software mitigation above. All the thresholds
+(`OVERCURRENT_LIMIT`, `COMMS_TIMEOUT_TICKS`, `IWDG_TIMEOUT_MS`) are
+placeholders, same caveat as every other tunable constant introduced since
+M2.
+
+**Post-M6: ISR-driven commutation.** M2 through M6 ran the entire
+commutation loop (BEMF sampling, zero-cross detection, stepping, duty
+application) from the slow 1kHz SysTick-driven main loop - explicitly
+flagged as a placeholder every time, since a single commutation step at
+these motors' real electrical rates can be tens of microseconds, far
+shorter than the 1ms tick could even resolve. That's now fixed:
+
+- The fast path moved entirely into the shared `ADC1_2` interrupt (STM32G4
+  routes ADC1 and ADC2 to one NVIC vector), each motor's own ADC
+  hardware-triggered off its PWM TRGO. `MotorIsrState<Br, S>` bundles a
+  motor's `Commutator`/`ZeroCrossDetector`/`Bridge`/sense front-end, owned
+  by a `cortex_m::interrupt::Mutex`-protected `static` per motor
+  (`MOTOR_A`/`MOTOR_B` in `main.rs`) so the ISR and the slow loop can both
+  reach it safely. `Bridge`'s channel types had to become concrete (type
+  aliases in `motor.rs`) instead of `impl Trait`, since opaque
+  return-position types can't appear in a `static`'s type.
+- The 1kHz tick is far too coarse for `Commutator`'s own timing too, so its
+  tick source changed to the Cortex-M DWT cycle counter (~16MHz, the core
+  clock) - a 32-bit hardware counter that wraps in seconds, hence
+  `aart-core::tick::TickExtender` (host-tested), which turns it into a
+  monotonic 64-bit tick by detecting wraparound. Safe because the ISR reads
+  it far more often than a 32-bit counter could ever wrap.
+- ADC sampling changed from the M1-era blocking `.convert()` (which
+  force-starts a software-triggered one-shot, ignoring any configured
+  hardware trigger) to `DynamicAdc` reconfigured/re-armed once per ISR
+  firing: `Adc<ADC,Disabled>` doesn't expose `into_dynamic_adc` (only
+  `PoweredDown` does), so construction now goes claim → power_down (type
+  state only) → `into_dynamic_adc` → power_up again. Each firing samples
+  one channel on a fixed rotation - the floating phase 14/16 of the time,
+  virtual-neutral and current each 1/16 - reconfiguring `Sequence::One` and
+  re-arming (`ADSTART` auto-clears after each single-conversion trigger)
+  before returning. The rotation split is a placeholder, not measured.
+- The slow loop no longer touches commutation at all; it reads/writes
+  shared state through `with_motor` (a short critical section per call) for
+  the differential controller, PWM-frequency scheduling, fault supervision,
+  and telemetry - matching the kernel model in section 5 that was written
+  before any of M2-M6 existed.
+- NVIC priority: `ADC1_2` set to the highest priority, `SysTick` explicitly
+  lowered, so the fast path always preempts the slow one.
+
+**What's unverified**: everything above compiles cleanly for the real
+target (debug, release, and the `cargo qemu` test-binary path all checked),
+but the actual real-time margins cannot be checked in this environment -
+there's no hardware here, and Renode's `adc_shim.py` (see section 6.3) is a
+passive register shim with no interrupt generation, so it can't exercise
+this path even in emulation. One thing to check on real hardware before
+trusting this: whether the 14/16-floating sampling rotation gives clean
+enough zero-cross timing in practice - that split is a placeholder, not
+measured.
+
+**Immediately after, the clock itself got fixed**: HSI16/no-PLL (the
+default the whole project ran on through M0-M6) was the root cause behind
+*both* caveats this milestone flagged - PWM duty resolution (`motor.rs`)
+and the ISR's CPU budget. `main.rs` now runs the PLL at 170MHz (M=÷4,
+N=×85, R=÷2 from HSI16 - the documented max for this series), which needs
+Range1 boost mode (`PWR`'s `vos(Range1{enable_boost:true})` plus
+`Config::boost(true)`; the HAL's `freeze()` handles the full documented
+transition sequence - AHB pre-halving, wait-state adjustment, switch -
+internally, not hand-rolled here). Both duty resolution and ISR headroom
+scale directly with this (roughly 10.6x more of each). One real bug this
+surfaced: `motor_commutator_config()` had `tick_hz` hardcoded to a literal
+16MHz rather than reading the actual configured clock, which would have
+silently mismatched the DWT counter's real rate the moment the clock
+changed - now takes `core_hz` read from `rcc.clocks.sys_clk` at runtime.
+Also had to move the ADC clock divider from HCLK/2 to HCLK/4
+(`sense::claim_common`): at 16MHz, /2 (8MHz) was nowhere near the ADC's
+~60MHz max input clock; at 170MHz, /2 (85MHz) would have been out of spec.
+Still unverified for the same reason as everything else here: no hardware
+to confirm the boost-mode transition and higher clock actually behave as
+the HAL's implementation (matching RM0440's documented sequence) intends.
 
 ## 9. Open questions (not blocking M0, but worth revisiting)
 

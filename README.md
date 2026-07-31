@@ -13,5 +13,7 @@ cd stm32_os
 cargo clean   
 cargo test --target thumbv7em-none-eabihf --features qemu   
 
-docker build -t stm32-os .   
+Docker build (run from the repo root — stm32_os depends on the sibling
+aart-core crate, so the build context can't be stm32_os/ alone):  
+docker build -t stm32-os -f stm32_os/Dockerfile .   
 docker run --rm stm32-os   

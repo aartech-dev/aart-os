@@ -51,6 +51,9 @@ gpioPortB: GPIOPort.STM32_GPIOPort @ sysbus <0x48000400, +0x400>
 gpioPortC: GPIOPort.STM32_GPIOPort @ sysbus <0x48000800, +0x400>
     numberOfAFs: 16
 
+gpioPortF: GPIOPort.STM32_GPIOPort @ sysbus <0x48001400, +0x400>
+    numberOfAFs: 16
+
 // --- A couple of general-purpose timers, in case you exercise them later ----
 timer2: Timers.STM32_Timer @ sysbus 0x40000000
     frequency: 16000000
@@ -59,6 +62,47 @@ timer2: Timers.STM32_Timer @ sysbus 0x40000000
 timer3: Timers.STM32_Timer @ sysbus 0x40000400
     frequency: 16000000
     -> nvic@29
+
+// --- Motor PWM timers (M1) --------------------------------------------------
+// TIM1/TIM8 are STM32G4 *advanced-control* timers (complementary outputs,
+// BDTR deadtime/break register, RCR repetition counter) - Renode's generic
+// Timers.STM32_Timer model (same class as timer2/3 above) is a *basic* timer
+// model. PSC/ARR/CNT/CCRx should read/write fine; BDTR is advanced-timer-only
+// and this model likely doesn't back it, so a write (e.g. our MOE/deadtime
+// setup in motor.rs) probably won't fault but also won't be read back
+// correctly if you write a test that checks it. Our firmware doesn't read
+// BDTR back, so this is a known gap rather than a blocker for M1.
+// IRQ lines intentionally left unwired - nothing in the firmware enables a
+// TIM1/TIM8 interrupt yet (M1 uses polling only); wire -> nvic@N when M2's
+// commutation ISR actually needs one.
+tim1: Timers.STM32_Timer @ sysbus 0x40012c00
+    frequency: 16000000
+
+tim8: Timers.STM32_Timer @ sysbus 0x40013400
+    frequency: 16000000
+
+// --- Command/telemetry UART (M1) --------------------------------------------
+// Class name/properties unverified in this sandbox (no Renode install here
+// to check against) - UART.STM32_UART is what most official Renode STM32
+// platform files use, but if this errors, grep your local Renode's
+// platforms/peripherals/UARTs/ for the actual class and adjust.
+usart1: UART.STM32_UART @ sysbus 0x40013800
+    frequency: 16000000
+
+// --- Motor phase/current/voltage sensing ADCs (M1) --------------------------
+// Renode ships no STM32G4 ADC model at all (same gap the RCC shim below
+// exists for) - adc_shim.py is a register-level shim, not a real ADC; see its
+// header comment for exactly what it fakes and why. ADC12_COMMON isn't on
+// the code path the shim targets, so it's left unmodeled here.
+adc1: Python.PythonPeripheral @ sysbus 0x50000000
+    size: 0x100
+    initable: true
+    filename: "adc_shim.py"
+
+adc2: Python.PythonPeripheral @ sysbus 0x50000100
+    size: 0x100
+    initable: true
+    filename: "adc_shim.py"
 
 // NOTE: PWR (0x40007000) and FLASH ACR (0x40022000) are NOT modeled here.
 // At the HAL's default HSI16 config that's fine (0 flash wait-states, VOS ready
