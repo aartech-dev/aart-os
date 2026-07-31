@@ -238,6 +238,17 @@ With option 2, the full two-motor pin table becomes:
 (Motor B's neutral pin shown here already reflects the G474 retarget —
 see §6.4. It was PB2 on the original G431 plan.)
 
+**Drag-brake ("Latvian brake") track-current sense — shared, not
+per-motor**: `PA2` (ADC1 channel 3) — see §6.5/7.5. This is a whole-car
+reading (total current the track is delivering to the car), taken once on
+the shared input rail, not duplicated per motor — physically hosted on
+motor A's ADC1 purely because it's the only ADC1-reachable pin still free
+on this 64-pin package once every other motor/UART pin was assigned.
+Repurposes `PA2`, previously left unused/reserved for possible future
+DShot input (§6.2/§9) — a real tradeoff, not a silent one: if DShot input
+is ever wanted later, a different pin (or a different ADC1 channel) needs
+finding for one of the two.
+
 Motor B's TIM8 pins were derived the same way — checked against the HAL's
 `TIM8` entry in `pins!`, filtered to the alternate-function options that
 actually exist on the LQFP64 package this Nucleo uses (STM32G431's 64-pin
@@ -451,6 +462,44 @@ design:
 real per-motor BOM cost of the front/rear layout, and it's linear, not
 quadratic, in motor count.
 
+**Drag-brake addition**: each motor's own current-sense point (PB11/PF1)
+upgrades from the bare shunt-to-ADC connection described above to a
+dedicated current-sense amplifier reading a low-value shunt resistor in
+that bridge's return path — better resolution for the existing overcurrent
+fault check (`aart-core::fault::FaultSupervisor`). Drag-brake detection
+itself, though, is deliberately **not** built from those two per-motor
+readings: what it needs to know is whether the track is delivering power
+to the car *at all*, which is a property of the single shared input rail,
+not either motor's individual draw. So there's a third, separate
+current-sense amplifier + shunt on the main input path (after
+reverse-polarity protection, before it splits to the two bridges), feeding
+its own ADC channel (`PA2`, ADC1 — see §6.1) sampled in software against a
+configured threshold, once for the whole car.
+
+This one is **bidirectional**, unlike the two per-motor amplifiers above:
+current flows one way through the shared input while the car is driving/
+accelerating (positive) and can flow the other way under braking/
+regenerative conditions (negative), so detection has to collapse to zero
+from *either* side, not just drop below a floor — see §7.5's
+`current_present` for how the firmware handles that (magnitude of
+deviation from the amplifier's zero-current reference, not the raw
+sample's absolute value).
+
+This was a deliberate choice over the alternative considered: a dedicated
+hardware comparator IC (e.g. TI's INA300/INA301, current-sense amplifier +
+integrated comparator + resistor-set threshold + digital alarm output)
+would react without any MCU involvement at all, and would keep working
+even if firmware hung — a real defense-in-depth argument for something
+safety-adjacent like braking. Rejected here in favor of the amplifier +
+shunt + software-threshold approach because: it's runtime-adjustable
+(even over the existing UART protocol, no board rework to retune) rather
+than fixed by a resistor value chosen at design time; it reuses the ADC/
+ISR infrastructure already being built rather than adding a new IC; and
+the latency argument for dedicated hardware matters for a *per-motor,
+per-PWM-cycle* check, which this isn't — "track power gone" is a
+tens-of-milliseconds event (a car going airborne), where 1kHz software
+polling is plenty fast. See §7.5 for what the firmware does with it.
+
 **Not yet done**: this section documents the *reference* circuit and how
 it maps onto our pin/driver architecture — there is no schematic/PCB for
 this project yet, only `aart-core`/`stm32_os` firmware targeting the
@@ -537,24 +586,24 @@ actually changes anything once a motor is Running.
 
 **Note on what "a"/"b" mean here**: `DiffController` itself is agnostic —
 its mixing math and BEMF slip trim only need *a* commanded ratio and each
-motor's eRPM, not what physically separates the two motors. In this
-project's actual 2-motor layout (motor A = front axle, motor B = rear
-axle, both solid-axle — see §7.4) it's used for **front/rear** balance, fed
-a feedforward from §7.4 rather than the raw UART `steer_cmd` directly.
-The description below is written in the original left/right framing this
-module was designed against, since that's still the clearer way to explain
-the mixing/slip-trim math itself; §7.4 covers what's different for
-front/rear.
+motor's eRPM, not what physically separates the two motors. This project
+actually supports **two** selectable 2-motor layouts (motor A/B are either
+left/right wheels or front/rear axles, chosen once at build time — see
+§7.6), and `DiffController` is reused unchanged for either: only the
+feedforward mapping from `steer_cmd` to the commanded ratio differs
+between them (§7.6). The description below is written in the original
+left/right framing this module was designed against, since that's still
+the clearer way to explain the mixing/slip-trim math itself; §7.6 covers
+what's different for front/rear.
 
 **Inputs**: `base_duty` (in practice always `sync_max_duty`, i.e. ~1.0 —
 there's no throttle command to vary it, see 7.1; kept as a parameter so
 this module doesn't need to know that convention and bench tests can still
-drive it directly), `steer_cmd` (from the UART protocol — for this
-project's actual layout, `axle_balance::front_rear_bias(steer_cmd, ...)`'s
-output takes this parameter's place; see §7.4), `erpm_a`/`erpm_b` (from
-each `Commutator`, i.e. **electrical speed derived from BEMF timing, not a
-ground-truth wheel speed** — this was the chosen starting point, see the
-note below).
+drive it directly), `steer_cmd` (from the UART protocol — folded through
+`DriveLayout::bias` first, see §7.6, before it reaches this parameter),
+`erpm_a`/`erpm_b` (from each `Commutator`, i.e. **electrical speed derived
+from BEMF timing, not a ground-truth wheel speed** — this was the chosen
+starting point, see the note below).
 
 **Output**: `target_duty_a`, `target_duty_b` — a skid-steer-style split,
 where `steer_cmd` biases one side down and the other up from `base_duty`.
@@ -583,12 +632,12 @@ asserting the controller cuts duty on the correct side.
 
 ### 7.4 Front/rear axle balance (`aart-core::axle_balance`)
 
-This project's actual chassis is a **2-motor, solid-axle front/rear
-layout** (motor A drives the front axle, motor B drives the rear — not
-left/right; there is no per-side split in hardware at all, since each
-axle only has one motor). Front/rear still needs balancing in a turn, but
-the geometry differs from left/right in a way that matters for the
-control law, not just the labeling:
+One of this project's two selectable 2-motor chassis layouts (§7.6) is a
+**solid-axle front/rear layout** (motor A drives the front axle, motor B
+drives the rear — not left/right; there is no per-side split in hardware
+at all in this layout, since each axle only has one motor). Front/rear
+still needs balancing in a turn, but the geometry differs from left/right
+in a way that matters for the control law, not just the labeling:
 
 - **Left/right** (§7.3's original framing): whichever side is on the
   *outside* of the turn needs to run faster. The correction is symmetric
@@ -620,6 +669,177 @@ zero bias, a left turn and a right turn of equal sharpness bias
 identically (unlike `DiffController`'s own steer-sign behavior), sharper
 turns bias harder, and zero gain disables the feedforward entirely
 (BEMF slip trim alone, no geometric prediction).
+
+### 7.5 Drag brake ("Latvian brake") (`aart-core::brake`)
+
+Slot car motors need *active* braking, not just coasting, at the one
+moment they're most likely to get it wrong: when a car loses electrical
+contact with the track, either because track power actually went off, or
+because the car left the slot (derailed, or airborne off a jump). Until
+now, the only thing that stops a motor is `Commutator`'s existing
+`Stalled` response (no zero-cross seen in time) — which just calls
+`Bridge::disable()`, true Hi-Z, pure coast. A coasting rotor keeps
+freewheeling from momentum with no braking at all, so by the time the car
+lands back on the track (or gets put back in the slot), its wheels are
+spinning at the wrong speed relative to the track surface — exactly the
+traction-loss moment this feature exists to prevent. Dead-shorting the
+motor's phases instead converts that kinetic energy into heat, stopping
+the wheels quickly.
+
+**Detection — shared, one measurement for the whole car, not per-motor.**
+What's being detected is whether the track is delivering power to the car
+at all, which is a property of the single input rail, not either motor's
+individual draw — so this is a *third* current-sense amplifier + shunt on
+the main input path (§6.5), feeding its own ADC1 channel (`PA2`), read in
+software. A dedicated hardware comparator IC (TI INA300-class: current-
+sense amp + integrated comparator + resistor-set threshold + digital
+alarm output) was considered and explicitly rejected in favor of this —
+see §6.5 for the full reasoning (runtime-adjustability and reusing the
+existing ADC/ISR infrastructure won out over the hardware comparator's
+MCU-independence, since "track power gone" is a tens-of-milliseconds
+event, not a per-PWM-cycle one).
+
+**Bidirectional, not a simple above/below-floor threshold.** The shared
+amplifier is bidirectional: current flows one way while driving/
+accelerating (positive) and can flow the other way under braking/
+regenerative conditions (negative) — a real track-power loss or
+derailment collapses the reading to zero from *either* side, so
+`aart_core::brake::current_present(sample, zero_offset, min_magnitude)`
+checks the *magnitude* of the deviation from the amplifier's zero-current
+reference point (`TRACK_CURRENT_ZERO_OFFSET` in `main.rs`, typically its
+mid-scale output — unverified against a real amplifier's actual reference
+design), not the raw sample's absolute value. `MIN_TRACK_CURRENT_MAGNITUDE`
+(`main.rs`) is how far from that reference a reading has to be, in either
+direction, to still count as "current present."
+
+**`aart_core::brake::DragBrakeSupervisor`** (one instance for the whole
+car, in `main.rs`'s slow 1kHz loop, not the ISR) turns that single
+`current_present` boolean into an engage/release decision applied to
+*both* motors' `Commutator`s together:
+
+- **Deliberately decoupled from `Commutator`/`RunPhase` entirely** — it
+  takes two plain bools (`eligible`, `current_present`) and returns
+  whether to engage, nothing else. `main.rs` computes `eligible` as
+  "either motor has gotten past its own `Startup` ramp" — before that,
+  low total current is still completely normal (low commanded duty during
+  the open-loop ramp), not a signal of anything; once *either* motor is
+  driving for real, a low shared reading becomes meaningful.
+- **Debounced** (`debounce_ticks`, `DRAG_BRAKE_DEBOUNCE_TICKS` in
+  `main.rs`): requires that many *consecutive* 1kHz ticks of "no current"
+  before engaging, rejecting a single noisy/glitched reading. A single
+  `current_present` tick immediately resets the counter and, if already
+  engaged, releases the brake right away — no debounce on the way out,
+  since a false "current is back" reading is far less costly than a false
+  "current is gone" one.
+
+**`Commutator` gained a fourth `RunPhase`, `Braking`** — entered only via
+an explicit `engage_drag_brake()` call from the code above (never derived
+internally; `Commutator` has no current-sensing input of its own). While
+`Braking`, `poll()` returns a fixed `drag_brake_duty` (a placeholder
+tunable, `DRAG_BRAKE_DUTY` in `main.rs`, independent of `sync_max_duty`/
+the differential controller's output — it's a dead-short chop ratio, not
+a commutation duty) and ignores `on_zero_cross` entirely, since the
+phases are shorted together, not floating per six-step — there's nothing
+meaningful to detect. `release_drag_brake()` resets every ramp/BEMF field
+and returns to `Startup`, exactly as if this were power-on: braking stops
+the rotor outright, so there's no coasting speed left to resume from once
+current returns.
+
+**`stm32_os::motor::Bridge` gained `brake(duty)`**: dead-shorts all three
+phases together through the low-side FETs (reusing exactly what
+`apply_step`'s existing `PhaseState::Low` arm already does per-phase —
+steady low-side conduction via the complementary output, high-side held
+off) for `duty` of the time, coasting (true `disable()`) the rest. Full
+engagement (`duty` == 1.0) is that low-side-short state held continuously.
+A *tunable* brake strength needs chopping between the two states across
+successive ISR firings at a fixed software-PWM resolution (16 steps) —
+the hardware timer's own duty register has no further per-call knob once
+a phase is already pinned "Low", so this couldn't reuse hardware PWM
+chopping the way normal commutation duty does. Coarse, but this only
+needs to be "hard enough to stop the wheels quickly," not switch cleanly
+at a particular frequency.
+
+**In the ISR** (`step_motor`, `main.rs`): while `Braking`, the BEMF
+zero-cross check is skipped (meaningless with all phases shorted) but
+current sampling continues on its usual rotation slots — both the
+existing per-motor `CURRENT_SLOT` and the new shared `TRACK_CURRENT_SLOT`
+(motor A's rotation only, see below) — so the slow loop keeps seeing
+fresh readings throughout and can tell when current returns. The bridge
+dispatch is a three-way match now (`Braking` → `bridge.brake(duty)`,
+`Stalled` → `bridge.disable()`, else → normal `apply_step`) rather than
+the old two-way Stalled/not-Stalled check.
+
+**The shared track-current channel lives inside motor A's rotation, not a
+new peripheral.** `SenseIsr` gained `configure_track_current()` with a
+default no-op body — `MotorASense` overrides it (adds a `TRACK_CURRENT_SLOT`
+to its existing 16-step rotation, reusing the same `current_sample()`
+register read every other slot already uses, no new trait method needed
+to read it back), `MotorBSense` doesn't need to implement anything.
+`MotorIsrState` gained `latest_track_current`, generic across both
+motors' state structs for simplicity, but only ever meaningfully populated
+on motor A's — motor B's copy holds an unused leftover value. This
+asymmetry (a "shared" reading physically hosted on one motor's ADC) is a
+direct consequence of the pin-availability constraint explained in §6.5:
+`ADC5`, the only otherwise-unused ADC peripheral on the G474, has no
+channel reachable on this 64-pin package other than two pins already
+committed to motor A's PWM, so it couldn't host this instead.
+
+Host-tested (`aart-core/src/brake.rs`, `aart-core/src/commutator.rs`):
+never engages during Startup no matter how long current is absent,
+engages only after the configured debounce, a single good reading resets
+the debounce counter, current returning releases immediately, stays
+engaged across ticks while still Braking and still absent, `poll()`
+returns the configured duty while Braking, zero-cross events are ignored
+while Braking, `release_drag_brake()` actually restarts sync from scratch
+(not just flips the phase flag), and `current_present` itself is tested
+separately: false exactly at the zero offset, true for both a positive
+(driving) and a negative (braking) deviation of equal magnitude, false
+within the deadband on either side, true right at the deadband boundary,
+and no overflow/panic at the raw sample range's extremes.
+
+**Not yet done / open questions**: the debounce tick count, brake duty,
+`TRACK_CURRENT_ZERO_OFFSET`, and `MIN_TRACK_CURRENT_MAGNITUDE` are all
+placeholders pending real bench tuning, same caveat as every other
+tunable in this project. A single shared measurement point can't
+distinguish "track power actually off" from "one motor lost contact while
+the other's still gripping" (e.g. a bumpy track jostling one wheel loose)
+— the earlier per-motor design would have caught that case too, at the
+cost of duplicated hardware for a scenario that hasn't been validated as
+worth it either way; revisit if real track behavior shows it matters.
+
+### 7.6 Drive layout selection (`aart-core::drive_layout`)
+
+This project supports **two** selectable 2-motor chassis layouts on the
+identical hardware/firmware base — a build-time choice
+(`DRIVE_LAYOUT` in `main.rs`), not a runtime command, since it reflects
+how the two motors are physically wired into the chassis:
+
+- **`TwoWheelLeftRight`**: motor A = left wheel, motor B = right wheel,
+  one driven axle — the original left/right differential §7.3 was
+  designed against. `steer_cmd` feeds `DiffController` directly, signed
+  and unmodified (clamped to `[-1, 1]`, the same range `DiffController`
+  itself clamps to).
+- **`FourWheelFrontRear`**: motor A = front axle, motor B = rear axle,
+  both driven, solid axles (§7.4). `steer_cmd` is folded through
+  `axle_balance::front_rear_bias` first — magnitude-only, fixed-direction,
+  since front/rear balance doesn't flip sign with turn direction the way
+  left/right does.
+
+Both layouts reuse `DiffController`/`BemfSlipEstimator` completely
+unchanged — the mixing math and BEMF-based slip trim don't need to know
+*why* the two motors should differ, only by how much (same reasoning
+§7.4 already established for front/rear specifically). `DriveLayout::bias
+(steer_cmd, axle_bias_gain)` is the single dispatch point: `main.rs` calls
+it once per tick and feeds the result into `diff_controller.update(...)`
+in place of the raw `steer_cmd`, for either layout — `axle_bias_gain` is
+simply ignored when `TwoWheelLeftRight` is selected.
+
+Host-tested (`aart-core/src/drive_layout.rs`): `TwoWheelLeftRight` passes
+`steer_cmd` through unmodified (and clamps at the bounds, and ignores the
+axle-bias gain entirely), `FourWheelFrontRear` delegates to
+`front_rear_bias` exactly (confirmed by checking that, unlike
+`TwoWheelLeftRight`, a left and a right turn of equal sharpness bias
+identically through it).
 
 ## 8. Milestones
 
@@ -786,6 +1006,70 @@ clarity). New `AXLE_BIAS_GAIN` constant, same placeholder caveat as every
 other tunable. Verified: 71 `aart-core` host tests pass (66 + 5 new), and
 `stm32_os` builds cleanly (debug + release, real `stm32g474` feature) with
 no warnings.
+
+**Post-axle-balance: drag brake ("Latvian brake").** New hardware and a
+new `Commutator` phase to actively brake both motors (not just coast) when
+the car loses electrical contact with the track — see §6.5/§7.5 for the
+full reasoning. Summary: a third, shared current-sense amplifier + shunt
+on the main input rail (not per-motor - alongside upgrading each motor's
+own existing bare-shunt current sense to a proper amplifier too) feeds a
+new ADC1 channel (`PA2`, repurposing the pin previously reserved for
+possible DShot input), read in software against a configured threshold -
+a dedicated hardware comparator IC was considered and rejected in favor of
+this (runtime-adjustable, reuses existing ADC/ISR infrastructure, and the
+speed argument for hardware doesn't really apply to a tens-of-milliseconds
+event). New `aart-core::brake` module (`DragBrakeSupervisor`, 6 host
+tests, decoupled from `Commutator`/`RunPhase` entirely - takes plain
+bools) debounces that shared reading and drives both motors' brakes
+together. `Commutator` gained a fourth `RunPhase::Braking`,
+`engage_drag_brake()`/`release_drag_brake()`, and a `drag_brake_duty`
+config field (4 new host tests). `stm32_os::motor::Bridge` gained
+`brake(duty)`, dead-shorting all three phases via the existing
+`PhaseState::Low` handling, duty-chopped across ISR firings at a fixed
+16-step software-PWM resolution (the hardware timer's own duty register
+has no further per-call knob once a phase is pinned Low). `main.rs`'s ISR
+dispatch became a three-way match (Braking/Stalled/else), and motor A's
+rotation gained a `TRACK_CURRENT_SLOT` alongside its existing
+`CURRENT_SLOT` to host the shared reading (`SenseIsr::configure_track_current`,
+default no-op so `MotorBSense` needs no changes).
+Verified: 81 `aart-core` host tests pass (71 + 10 new), and `stm32_os`
+builds cleanly (debug + release, real `stm32g474` feature) with no
+warnings. Not verified: the debounce count, brake duty, and
+`MIN_TRACK_CURRENT` threshold are all placeholders pending real bench
+tuning - no hardware exists yet to tune them against.
+
+**Post-drag-brake: bidirectional current detection + selectable drive
+layout.** Two follow-ups from the same conversation - see §6.5/§7.5 and
+§7.6 for the full reasoning.
+
+Bidirectional detection: the shared track-current amplifier needed to
+collapse-to-zero from *either* positive (driving/accelerating) or negative
+(braking/regenerative) current, not just drop below a floor - a plain
+unipolar threshold would have missed a power-loss event that happened to
+occur while current was flowing backward. New `aart_core::brake::
+current_present(sample, zero_offset, min_magnitude)` checks the magnitude
+of deviation from the amplifier's zero-current reference instead of the
+raw sample's absolute value (6 new host tests: false at the reference
+point, true for positive and negative deviations of equal magnitude,
+false within the deadband on both sides, true at the deadband boundary,
+no overflow at the sample range's extremes). `main.rs`'s old
+`MIN_TRACK_CURRENT` constant split into `TRACK_CURRENT_ZERO_OFFSET` and
+`MIN_TRACK_CURRENT_MAGNITUDE`.
+
+Selectable drive layout: the left/right differential from before the
+front/rear pivot (§7.3's original framing) is back, as an equally-valid,
+explicitly selectable second layout rather than something the front/rear
+work silently replaced. New `aart_core::drive_layout` module
+(`DriveLayout` enum, `TwoWheelLeftRight`/`FourWheelFrontRear`, 4 host
+tests) is the single dispatch point between the two - both reuse
+`DiffController`/`BemfSlipEstimator` completely unchanged, only the
+`steer_cmd` feedforward differs. `main.rs` gained a `DRIVE_LAYOUT`
+build-time constant and renamed `axle_controller`/`axle_bias` back to
+`diff_controller`/`bias_cmd` (no longer implies front/rear-only).
+
+Verified: 91 `aart-core` host tests pass (81 + 10 new), and `stm32_os`
+builds cleanly (debug + release, real `stm32g474` feature) with no
+warnings.
 
 ## 9. Open questions (not blocking M0, but worth revisiting)
 

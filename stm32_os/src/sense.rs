@@ -15,6 +15,13 @@
 //! neutral into the same rotation as phase/current on ADC1/ADC2, which used
 //! to cost a full rotation slot per motor (see main.rs's old NEUTRAL_SLOT).
 //!
+//! `MotorASense` additionally hosts one shared, whole-car channel that has
+//! nothing to do with motor A specifically: the drag-brake ("Latvian
+//! brake") track-current sense pin (PA2, ADC1) - see `configure_track_current`
+//! and DESIGN.md section 6.5/7.5. It landed on ADC1 for lack of a spare ADC
+//! channel elsewhere on this 64-pin package, not because the reading is
+//! motor-A-specific.
+//!
 //! Uses `DynamicAdc` (plain `&mut self` methods) rather than the crate's
 //! typed `Adc<ADC, Configured/Active>` state machine: the ISR-driven fast
 //! path (main.rs) repeatedly reconfigures which single channel is armed and
@@ -28,7 +35,7 @@ use embedded_hal::delay::DelayNs;
 use aart_core::commutator::Phase;
 use stm32g4xx_hal::adc::config::{ClockMode, Continuous, Eoc, ExternalTrigger12, SampleTime, Sequence, TriggerMode};
 use stm32g4xx_hal::adc::{AdcClaim, AdcCommon, AdcCommonExt, DynamicAdc};
-use stm32g4xx_hal::gpio::{Analog, PA0, PA1, PA3, PA4, PA5, PA6, PB1, PB11, PB12, PB14, PF1};
+use stm32g4xx_hal::gpio::{Analog, PA0, PA1, PA2, PA3, PA4, PA5, PA6, PB1, PB11, PB12, PB14, PF1};
 use stm32g4xx_hal::rcc::Rcc;
 use stm32g4xx_hal::stm32::{ADC1, ADC12_COMMON, ADC2, ADC3, ADC345_COMMON, ADC4};
 
@@ -89,6 +96,18 @@ pub trait SenseIsr {
     /// motor A, ADC4 for motor B) - always fresh, no rotation/rearm needed
     /// since that ADC never stops converting.
     fn neutral_sample(&self) -> u16;
+    /// Reconfigures the armed channel to the shared drag-brake track-
+    /// current sense pin (see DESIGN.md section 6.5/7.5) instead of a
+    /// motor phase - a whole-car reading, not per-motor, physically wired
+    /// to whichever motor's ADC has a free channel left for it (motor A's
+    /// ADC1, via PA2 - the only ADC1-reachable pin still free on this
+    /// package once every other motor/UART pin was assigned). Default
+    /// no-op so `MotorBSense`, which has no pin for this, doesn't need to
+    /// implement anything - reading it back doesn't need a separate
+    /// method either, since whatever this configures still comes back
+    /// through the same `current_sample()` register read as every other
+    /// slot (see step_motor).
+    fn configure_track_current(&mut self) {}
     /// True if this ADC (not necessarily the other motor's) is the one
     /// that raised the shared ADC1_2 interrupt.
     fn eoc_pending(&self) -> bool;
@@ -111,6 +130,10 @@ pub struct MotorASense {
     adc_neutral: DynamicAdc<ADC3>,
     #[allow(dead_code)]
     neutral: PB1<Analog>,
+    // Shared drag-brake track-current sense - see configure_track_current.
+    // Physically nothing to do with motor A specifically, just hosted on
+    // motor A's ADC1 for lack of a spare ADC channel elsewhere.
+    track_current: PA2<Analog>,
 }
 
 impl MotorASense {
@@ -141,6 +164,10 @@ impl SenseIsr for MotorASense {
         self.adc_neutral.current_sample()
     }
 
+    fn configure_track_current(&mut self) {
+        self.adc.configure_channel(&self.track_current, Sequence::One, SAMPLE_TIME);
+    }
+
     fn eoc_pending(&self) -> bool {
         unsafe { (*ADC1::ptr()).isr().read().eoc().bit_is_set() }
     }
@@ -166,6 +193,7 @@ pub fn motor_a_sense(
     adc3: ADC3,
     common345: &AdcCommon<ADC345_COMMON>,
     neutral: PB1<Analog>,
+    track_current: PA2<Analog>,
     delay: &mut impl DelayNs,
 ) -> MotorASense {
     // claim() already powers up once internally (returns Disabled, not
@@ -207,6 +235,7 @@ pub fn motor_a_sense(
         bus_voltage,
         adc_neutral,
         neutral,
+        track_current,
     }
 }
 

@@ -40,6 +40,13 @@ pub enum RunPhase {
     Running,
     /// No zero-cross seen within the expected window at the current rate.
     Stalled,
+    /// Drag brake ("Latvian brake", see `aart_core::brake`) engaged: the
+    /// bridge dead-shorts the phases at `CommutatorConfig::drag_brake_duty`
+    /// instead of commutating - not entered from within this module at all
+    /// (`Commutator` has no current-sensing input), only via an explicit
+    /// `engage_drag_brake()` call from whatever's watching for lost track
+    /// power / a derailment.
+    Braking,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +220,10 @@ pub struct CommutatorConfig {
     /// Declare a stall if no zero-cross arrives within
     /// `stall_multiplier * period_estimate` ticks of the last one.
     pub stall_multiplier: u32,
+    /// Duty applied while `Braking` (see `engage_drag_brake`) - independent
+    /// of `sync_max_duty`/the differential controller's output, since this
+    /// is a dead-short chop ratio, not a commutation duty.
+    pub drag_brake_duty: f32,
 }
 
 /// Ticks between consecutive zero-crossings (1/6 of an electrical
@@ -300,8 +311,30 @@ impl Commutator {
         match self.phase {
             RunPhase::Startup => self.commanded_erpm,
             RunPhase::Running => self.electrical_rpm().unwrap_or(0),
-            RunPhase::Stalled => 0,
+            RunPhase::Stalled | RunPhase::Braking => 0,
         }
+    }
+
+    /// Engages the drag brake ("Latvian brake") - see `aart_core::brake`
+    /// for the actual trigger logic (debounced current-loss detection).
+    /// Idempotent: calling this while already `Braking` is harmless.
+    pub fn engage_drag_brake(&mut self) {
+        self.phase = RunPhase::Braking;
+    }
+
+    /// Releases the drag brake and restarts sync from scratch, exactly as
+    /// if this were power-on - braking dead-shorts the phases, so there's
+    /// no coasting speed left to resume from once current returns (track
+    /// power back, or the car back in the slot).
+    pub fn release_drag_brake(&mut self) {
+        self.phase = RunPhase::Startup;
+        self.step = 1;
+        self.target_duty = 0.0;
+        self.commanded_erpm = self.config.sync_start_erpm;
+        self.last_zero_cross = None;
+        self.period_estimate = None;
+        self.period_estimate_trusted = false;
+        self.next_commutation = None;
     }
 
     /// Call when a BEMF zero-crossing is detected on the currently-floating
@@ -343,6 +376,11 @@ impl Commutator {
                 step: self.step,
                 duty: 0.0,
                 phase: RunPhase::Stalled,
+            },
+            RunPhase::Braking => Output {
+                step: self.step,
+                duty: self.config.drag_brake_duty,
+                phase: RunPhase::Braking,
             },
         }
     }
@@ -478,6 +516,7 @@ mod tests {
             sync_max_duty: 1.0,
             sync_ramp_erpm_per_step: 100,
             stall_multiplier: 3,
+            drag_brake_duty: 0.6,
         }
     }
 
@@ -832,6 +871,52 @@ mod tests {
         assert!(!b.check(2, 1000, 2048));
         assert!(b.check(2, 2500, 2048)); // b's own rising crossing fires...
         assert!(a.check(1, 1000, 2048)); // ...independently of a's falling crossing firing here.
+    }
+
+    #[test]
+    fn engage_drag_brake_overrides_running_with_the_configured_duty() {
+        let (mut c, start) = spun_up();
+        c.set_target_duty(0.9);
+
+        c.engage_drag_brake();
+        let out = c.poll(start + 1);
+        assert_eq!(out.phase, RunPhase::Braking);
+        assert!(approx(out.duty, test_config().drag_brake_duty));
+    }
+
+    #[test]
+    fn drag_brake_ignores_zero_cross_events() {
+        let (mut c, start) = spun_up();
+        c.engage_drag_brake();
+        // A stray zero-cross (real hardware noise, or the tail end of
+        // coasting BEMF) must not un-brake anything or perturb state.
+        c.on_zero_cross(start + 500);
+        let out = c.poll(start + 501);
+        assert_eq!(out.phase, RunPhase::Braking);
+    }
+
+    #[test]
+    fn release_drag_brake_restarts_sync_from_scratch() {
+        let (mut c, start) = spun_up();
+        c.engage_drag_brake();
+        c.poll(start + 1);
+
+        c.release_drag_brake();
+        assert_eq!(c.phase(), RunPhase::Startup);
+        assert_eq!(c.current_erpm(), test_config().sync_start_erpm);
+        assert_eq!(c.electrical_rpm(), None, "trusted period must not survive a release");
+
+        // Confirm it actually re-syncs like a fresh Commutator, not just
+        // that the phase flag flipped.
+        assert_eq!(c.poll(start + 2).phase, RunPhase::Startup);
+    }
+
+    #[test]
+    fn current_erpm_is_zero_while_braking() {
+        let (mut c, start) = spun_up();
+        c.engage_drag_brake();
+        c.poll(start + 1);
+        assert_eq!(c.current_erpm(), 0);
     }
 
     #[test]

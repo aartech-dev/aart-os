@@ -50,6 +50,8 @@ pub struct Bridge<A, B, C> {
     high_c: C,
     tim: *const tim1::RegisterBlock,
     base_clock_hz: u32,
+    /// Software-PWM position for `brake`'s duty chopping - see there.
+    brake_counter: u8,
 }
 
 // SAFETY: `tim` points at a fixed peripheral base address, not real shared
@@ -72,6 +74,7 @@ pub trait BridgeControl {
     fn max_duty(&self) -> u16;
     fn apply_step(&mut self, pattern: StepPattern, duty: u16);
     fn disable(&mut self);
+    fn brake(&mut self, duty: f32);
 }
 
 impl<A, B, C> BridgeControl for Bridge<A, B, C>
@@ -88,6 +91,9 @@ where
     }
     fn disable(&mut self) {
         Bridge::disable(self)
+    }
+    fn brake(&mut self, duty: f32) {
+        Bridge::brake(self, duty)
     }
 }
 
@@ -134,6 +140,41 @@ where
                 channel.set_duty(0);
             }
             PhaseState::Float => channel.disable(),
+        }
+    }
+
+    /// Drag brake ("Latvian brake", see `aart_core::brake`): dead-shorts
+    /// the motor's three phases together through the low-side FETs for
+    /// `duty` (0.0-1.0) of the time, coasting (true Hi-Z) the rest -
+    /// converts the rotor's kinetic energy into heat instead of letting it
+    /// freewheel, which matters when the car's left the track (a jump, or
+    /// derailed) and would otherwise land/re-seat with the wheels still
+    /// spinning at the wrong speed.
+    ///
+    /// "All three phases Low" is exactly what `apply_phase`'s `Low` arm
+    /// already does per-phase (steady low-side conduction via the
+    /// complementary output, high-side held off) - full engagement
+    /// (`duty` == 1.0) is just that, all three at once, continuously. But
+    /// `Low` there means "the hardware timer's duty register is pinned at
+    /// 0", which has no further per-call knob to make it partial - so a
+    /// *tunable* brake strength has to chop between the fully-shorted
+    /// state and `disable()` (coast) across successive calls instead, at a
+    /// fixed software-PWM resolution (`STEPS`). Coarse (STEPS/ISR-rate
+    /// effective chop frequency) but simple, and this only needs to be
+    /// "hard enough to stop the wheels quickly," not switch cleanly at any
+    /// particular frequency.
+    pub fn brake(&mut self, duty: f32) {
+        const STEPS: u8 = 16;
+        let threshold = ((duty.clamp(0.0, 1.0) * STEPS as f32) as u8).min(STEPS);
+        let engage = self.brake_counter < threshold;
+        self.brake_counter = (self.brake_counter + 1) % STEPS;
+
+        if engage {
+            Self::apply_phase(&mut self.high_a, PhaseState::Low, 0);
+            Self::apply_phase(&mut self.high_b, PhaseState::Low, 0);
+            Self::apply_phase(&mut self.high_c, PhaseState::Low, 0);
+        } else {
+            self.disable();
         }
     }
 
@@ -245,6 +286,7 @@ pub fn motor_a_bridge(
             high_c,
             tim: TIM1::ptr(),
             base_clock_hz,
+            brake_counter: 0,
         },
     )
 }
@@ -294,6 +336,7 @@ pub fn motor_b_bridge(
             high_c,
             tim: TIM8::ptr(),
             base_clock_hz,
+            brake_counter: 0,
         },
     )
 }

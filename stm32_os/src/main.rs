@@ -22,11 +22,12 @@ use stm32g4xx_hal::rcc::{Config, PllConfig, PllMDiv, PllNMul, PllRDiv, PllSrc, R
 use stm32g4xx_hal::stm32::{interrupt, Interrupt};
 use stm32g4xx_hal::time::ExtU32;
 
-use aart_core::axle_balance::{front_rear_bias, AxleBalanceConfig};
+use aart_core::brake::{current_present, DragBrakeConfig, DragBrakeSupervisor};
 use aart_core::commutator::{
     floating_phase, step_pattern, Commutator, CommutatorConfig, RunPhase, ZeroCrossDetector,
 };
 use aart_core::diff_ctrl::{BemfSlipEstimator, DiffController, DiffControllerConfig};
+use aart_core::drive_layout::DriveLayout;
 use aart_core::fault::{FaultConfig, FaultSupervisor};
 use aart_core::protocol::{format_error, format_telemetry, parse_line, Command, LineReader};
 use aart_core::scheduler::Scheduler;
@@ -57,19 +58,26 @@ struct MotorIsrState<Br, S> {
     bridge: Br,
     sense: S,
     tick_extender: TickExtender,
-    /// Cycles between sampling the floating phase (most of the time) and
-    /// current on a fixed schedule - see step_motor. 16 is a placeholder
-    /// split (15/16 floating, 1/16 current), not derived from real timing
-    /// measurements. Neutral no longer needs a rotation slot at all: it has
-    /// its own dedicated free-running ADC (ADC3 for motor A, ADC4 for motor
-    /// B - see sense.rs), so a fresh reading is always available without
-    /// stealing a slot from phase/current sampling on ADC1/ADC2.
+    /// Cycles between sampling the floating phase (most of the time),
+    /// current, and (motor A only - see sense.rs's `configure_track_current`
+    /// doc comment) the shared drag-brake track-current sense, on a fixed
+    /// schedule - see step_motor. 16 is a placeholder split, not derived
+    /// from real timing measurements. Neutral no longer needs a rotation
+    /// slot at all: it has its own dedicated free-running ADC (ADC3 for
+    /// motor A, ADC4 for motor B - see sense.rs), so a fresh reading is
+    /// always available without stealing a slot from phase/current
+    /// sampling on ADC1/ADC2.
     rotation: u8,
     latest_current: u16,
+    /// Only ever meaningfully populated on motor A's state (see sense.rs) -
+    /// motor B's copy holds whatever leftover sample landed in
+    /// TRACK_CURRENT_SLOT via SenseIsr's default no-op and is never read.
+    latest_track_current: u16,
 }
 
 const ROTATION_LEN: u8 = 16;
 const CURRENT_SLOT: u8 = 8;
+const TRACK_CURRENT_SLOT: u8 = 0;
 
 impl<Br, S> MotorIsrState<Br, S> {
     fn new(commutator: Commutator, bridge: Br, sense: S) -> Self {
@@ -81,6 +89,7 @@ impl<Br, S> MotorIsrState<Br, S> {
             tick_extender: TickExtender::new(),
             rotation: 0,
             latest_current: 0,
+            latest_track_current: 0,
         }
     }
 }
@@ -104,9 +113,16 @@ fn step_motor<Br: BridgeControl, S: SenseIsr>(state: &mut MotorIsrState<Br, S>) 
     let sample = state.sense.current_sample();
     state.sense.clear_eoc();
 
+    // While Braking, the phases are dead-shorted together (see
+    // Bridge::brake), not floating per six-step - a BEMF zero-cross check
+    // is meaningless there, so skip it rather than feed it garbage.
     if state.rotation == CURRENT_SLOT {
         state.latest_current = sample;
-    } else {
+    } else if state.rotation == TRACK_CURRENT_SLOT {
+        // Same generic register read as every other slot - only
+        // meaningful on motor A's state (see MotorIsrState's field doc).
+        state.latest_track_current = sample;
+    } else if state.commutator.phase() != RunPhase::Braking {
         let step = state.commutator.step();
         let neutral = state.sense.neutral_sample();
         if state.zero_cross.check(step, sample, neutral) {
@@ -115,19 +131,25 @@ fn step_motor<Br: BridgeControl, S: SenseIsr>(state: &mut MotorIsrState<Br, S>) 
     }
 
     let out = state.commutator.poll(tick);
-    if out.phase == RunPhase::Stalled {
-        // apply_step(..., 0) would still drive two phases low (0% duty is
-        // a steady low, not Hi-Z) - a real safe-stop needs all three phases
-        // actually disabled, which only disable() does.
-        state.bridge.disable();
-    } else {
-        let duty_counts = (out.duty * state.bridge.max_duty() as f32) as u16;
-        state.bridge.apply_step(step_pattern(out.step), duty_counts);
+    match out.phase {
+        RunPhase::Braking => state.bridge.brake(out.duty),
+        RunPhase::Stalled => {
+            // apply_step(..., 0) would still drive two phases low (0% duty
+            // is a steady low, not Hi-Z) - a real safe-stop needs all three
+            // phases actually disabled, which only disable() does.
+            state.bridge.disable();
+        }
+        RunPhase::Startup | RunPhase::Running => {
+            let duty_counts = (out.duty * state.bridge.max_duty() as f32) as u16;
+            state.bridge.apply_step(step_pattern(out.step), duty_counts);
+        }
     }
 
     state.rotation = (state.rotation + 1) % ROTATION_LEN;
     if state.rotation == CURRENT_SLOT {
         state.sense.configure_current();
+    } else if state.rotation == TRACK_CURRENT_SLOT {
+        state.sense.configure_track_current();
     } else {
         state.sense.configure_phase(floating_phase(out.step));
     }
@@ -156,15 +178,47 @@ fn ADC1_2() {
 
 // These are slot car motors: there is no throttle input, and once a motor
 // hands off to closed-loop it runs at this duty permanently (all volts/
-// current switched straight to the phases - "no PWM"). The axle-balance
-// controller is the only thing that ever pulls duty below this, and only
-// for whichever axle it's biasing down. 1.0 = literally 100%.
+// current switched straight to the phases - "no PWM"). The diff/axle-
+// balance controller is the only thing that ever pulls duty below this,
+// and only for whichever side/axle it's biasing down. 1.0 = literally 100%.
 const RUNNING_BASE_DUTY: f32 = 1.0;
 
-// Front/rear feedforward gain (see aart_core::axle_balance) - a placeholder
-// pending real tuning against this chassis's actual wheelbase and turn
-// radii, same caveat as every other tunable below.
+// Which physical car this firmware is built for - motor A/motor B's real
+// mechanical role (left/right wheel vs. front/rear axle) depends entirely
+// on this, since both layouts reuse the identical DiffController/
+// BemfSlipEstimator machinery underneath (see aart_core::drive_layout).
+// Change this and reflash to retarget the same 2-motor hardware to the
+// other chassis - it's a build-time choice, not something read from a
+// runtime command, since it reflects how the motors are physically wired
+// in, not a steering input.
+const DRIVE_LAYOUT: DriveLayout = DriveLayout::FourWheelFrontRear;
+
+// Front/rear feedforward gain (see aart_core::axle_balance) - only used
+// when DRIVE_LAYOUT is FourWheelFrontRear (ignored for TwoWheelLeftRight,
+// see DriveLayout::bias). A placeholder pending real tuning against this
+// chassis's actual wheelbase and turn radii, same caveat as every other
+// tunable below.
 const AXLE_BIAS_GAIN: f32 = 0.5;
+
+// Drag brake ("Latvian brake", see aart_core::brake and DESIGN.md section
+// 7.5) - placeholders pending real tuning, same caveat as everything else
+// below. DUTY is how hard Bridge::brake chops the winding short, not a
+// commutation duty; DEBOUNCE_TICKS is how many consecutive main-loop ticks
+// (1kHz, see TICK_HZ) the shared track-current reading must stay collapsed
+// before engaging, to reject a single noisy/glitched reading.
+//
+// The shared track-current amplifier (DESIGN.md 6.5) is bidirectional:
+// positive current while driving/accelerating, negative under braking/
+// regenerative conditions - TRACK_CURRENT_ZERO_OFFSET is its raw ADC
+// reading at zero current (typically mid-scale; depends on the actual
+// amplifier's reference design, unverified against real hardware) and
+// MIN_TRACK_CURRENT_MAGNITUDE is how far from that offset (in either
+// direction, see aart_core::brake::current_present) a reading needs to be
+// to still count as "current present."
+const DRAG_BRAKE_DUTY: f32 = 0.6;
+const DRAG_BRAKE_DEBOUNCE_TICKS: u16 = 5;
+const TRACK_CURRENT_ZERO_OFFSET: u16 = 2_048;
+const MIN_TRACK_CURRENT_MAGNITUDE: u16 = 50;
 
 // All the numbers below are placeholders pending real tuning on an actual
 // 1106 motor/track - nothing here is derived from real motor characteristics
@@ -193,6 +247,7 @@ fn motor_commutator_config(core_hz: u32) -> CommutatorConfig {
         sync_max_duty: RUNNING_BASE_DUTY,
         sync_ramp_erpm_per_step: 500,
         stall_multiplier: 8,
+        drag_brake_duty: DRAG_BRAKE_DUTY,
     }
 }
 
@@ -307,6 +362,14 @@ fn main() -> ! {
         dp.ADC3,
         &adc_common_345,
         gpiob.pb1.into_analog(),
+        // Drag-brake ("Latvian brake") track-current sense (DESIGN.md
+        // section 6.5/7.5) - a whole-car reading (total current supplied by
+        // the track), not motor-A-specific; it lands here for lack of a
+        // spare ADC1-reachable pin anywhere else on this 64-pin package.
+        // Repurposes PA2, previously reserved (unused) for possible future
+        // DShot input (section 6.2/9) - a real tradeoff, flagged in
+        // DESIGN.md, not a silent one.
+        gpioa.pa2.into_analog(),
         &mut delay,
     );
 
@@ -331,6 +394,7 @@ fn main() -> ! {
         gpiob.pb7.into_alternate(),
         &mut rcc,
     );
+
 
     // Both motors' PWM outputs start disabled (pwm_advanced().finalize()
     // leaves them that way) and get enabled per-phase by apply_step() (now
@@ -377,14 +441,13 @@ fn main() -> ! {
     let mut last_freq_khz_a = motor::PWM_FREQUENCY_MIN_KHZ;
     let mut last_freq_khz_b = motor::PWM_FREQUENCY_MIN_KHZ;
 
-    // This is a 2-motor front/rear layout (motor A = front axle, motor B =
-    // rear axle, both solid-axle - no left/right split exists in hardware
-    // at all). slip_threshold/slip_gain are placeholders pending real
+    // Motor A/B are left/right or front/rear depending on DRIVE_LAYOUT
+    // above - slip_threshold/slip_gain are placeholders pending real
     // tuning on hardware, same as motor_commutator_config()'s sync numbers.
-    // DiffController's mixing/slip-trim math doesn't care whether "a"/"b"
-    // are left/right or front/rear, only aart_core::axle_balance's
-    // feedforward (below) needs to know which - see DESIGN.md section 7.4.
-    let mut axle_controller = DiffController::new(
+    // DiffController's mixing/slip-trim math doesn't care which layout is
+    // active, only DriveLayout::bias (below) needs to know - see
+    // DESIGN.md section 7.6.
+    let mut diff_controller = DiffController::new(
         DiffControllerConfig {
             slip_threshold: 0.05,
             slip_gain: 2.0,
@@ -394,11 +457,21 @@ fn main() -> ! {
     // steer_cmd is the only thing STEER actually changes here - THR is still
     // parsed (see the command loop below) but there is no throttle input on
     // real hardware (track voltage controls speed, not this device), so it
-    // has nothing to drive. Its sign (turn direction) doesn't reach
-    // axle_controller directly: front_rear_bias folds it to a magnitude-only,
-    // fixed-direction bias first (see the main loop) since front/rear
-    // balance, unlike left/right, doesn't flip with turn direction.
+    // has nothing to drive. Its sign (turn direction) reaches
+    // diff_controller through DRIVE_LAYOUT.bias() first (see the main
+    // loop) - passed straight through for TwoWheelLeftRight, folded to a
+    // magnitude-only fixed-direction bias for FourWheelFrontRear.
     let mut steer_cmd = 0.0f32;
+
+    // Drag-brake ("Latvian brake") supervisor - one for the whole car, not
+    // per motor: what it watches is whether the track is still delivering
+    // power to the car at all (the shared PA2/ADC1 track-current sense,
+    // DESIGN.md section 6.5), not either motor's own draw. See
+    // aart_core::brake and DESIGN.md section 7.5.
+    let mut drag_brake = DragBrakeSupervisor::new(DragBrakeConfig {
+        duty: DRAG_BRAKE_DUTY,
+        debounce_ticks: DRAG_BRAKE_DEBOUNCE_TICKS,
+    });
     // Overwritten every tick before the (conditional, once-per-telemetry-
     // period) read below, so this initial value is never itself observed -
     // that's expected for loop-carried state, not a real dead store.
@@ -449,33 +522,75 @@ fn main() -> ! {
             scheduler.tick();
             let now = scheduler.current_tick();
 
-            let (erpm_a, current_erpm_a, current_sample_a, stalled_a) =
+            let (erpm_a, current_erpm_a, current_sample_a, stalled_a, run_phase_a) =
                 with_motor(&MOTOR_A, |m| {
                     (
                         m.commutator.electrical_rpm(),
                         m.commutator.current_erpm(),
                         m.latest_current,
                         m.commutator.phase() == RunPhase::Stalled,
+                        m.commutator.phase(),
                     )
                 });
-            let (erpm_b, current_erpm_b, current_sample_b, stalled_b) =
+            let (erpm_b, current_erpm_b, current_sample_b, stalled_b, run_phase_b) =
                 with_motor(&MOTOR_B, |m| {
                     (
                         m.commutator.electrical_rpm(),
                         m.commutator.current_erpm(),
                         m.latest_current,
                         m.commutator.phase() == RunPhase::Stalled,
+                        m.commutator.phase(),
                     )
                 });
 
-            // front_rear_bias turns the signed steer command into the
-            // magnitude-only, fixed-direction axle bias this layout actually
-            // needs (see aart_core::axle_balance and DESIGN.md section 7.4)
-            // before axle_controller's shared mixing/slip-trim math runs.
-            let axle_bias = front_rear_bias(steer_cmd, AxleBalanceConfig { bias_gain: AXLE_BIAS_GAIN });
-            let diff_out = axle_controller.update(RUNNING_BASE_DUTY, axle_bias, erpm_a, erpm_b);
-            with_motor(&MOTOR_A, |m| m.commutator.set_target_duty(diff_out.target_duty_a)); // front
-            with_motor(&MOTOR_B, |m| m.commutator.set_target_duty(diff_out.target_duty_b)); // rear
+            // Drag brake: a whole-car decision, not per-motor - the shared
+            // track-current reading (motor A's ISR state only, see
+            // MotorIsrState's field doc) tells us whether the track is
+            // still delivering power to the car at all. Eligible once
+            // either motor has gotten past its own sync ramp - before that,
+            // low total current is still perfectly normal (low commanded
+            // duty during the open-loop ramp), not a signal of anything.
+            // Checked every tick regardless of fault/axle-balance state
+            // below, since this is a safety response, not a steering input.
+            let track_current = with_motor(&MOTOR_A, |m| m.latest_track_current);
+            // Bidirectional: a collapse to zero from either positive
+            // (driving/accelerating) or negative (braking/regenerative)
+            // current means the same thing here - see current_present's
+            // doc comment and DESIGN.md section 6.5/7.5.
+            let track_current_present = current_present(
+                track_current,
+                TRACK_CURRENT_ZERO_OFFSET,
+                MIN_TRACK_CURRENT_MAGNITUDE,
+            );
+            let eligible = !matches!(run_phase_a, RunPhase::Startup)
+                || !matches!(run_phase_b, RunPhase::Startup);
+            let brake_engaged = drag_brake.update(eligible, track_current_present);
+            if brake_engaged {
+                if run_phase_a != RunPhase::Braking {
+                    with_motor(&MOTOR_A, |m| m.commutator.engage_drag_brake());
+                }
+                if run_phase_b != RunPhase::Braking {
+                    with_motor(&MOTOR_B, |m| m.commutator.engage_drag_brake());
+                }
+            } else {
+                if run_phase_a == RunPhase::Braking {
+                    with_motor(&MOTOR_A, |m| m.commutator.release_drag_brake());
+                }
+                if run_phase_b == RunPhase::Braking {
+                    with_motor(&MOTOR_B, |m| m.commutator.release_drag_brake());
+                }
+            }
+
+            // DRIVE_LAYOUT.bias() turns the signed steer command into
+            // whatever diff_controller's shared mixing/slip-trim math
+            // actually needs for the selected chassis - straight through
+            // for TwoWheelLeftRight, a magnitude-only fixed-direction bias
+            // for FourWheelFrontRear (see aart_core::drive_layout and
+            // DESIGN.md section 7.6).
+            let bias_cmd = DRIVE_LAYOUT.bias(steer_cmd, AXLE_BIAS_GAIN);
+            let diff_out = diff_controller.update(RUNNING_BASE_DUTY, bias_cmd, erpm_a, erpm_b);
+            with_motor(&MOTOR_A, |m| m.commutator.set_target_duty(diff_out.target_duty_a));
+            with_motor(&MOTOR_B, |m| m.commutator.set_target_duty(diff_out.target_duty_b));
             last_slip_estimate = diff_out.slip_estimate;
 
             // PWM switching frequency tracks live speed throughout sync and
