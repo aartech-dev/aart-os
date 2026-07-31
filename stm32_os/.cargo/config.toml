@@ -9,9 +9,9 @@
 # fails FAST ("no probe found") instead of hanging. The dangerous path is now
 # impossible to hit by accident.
 #
-# Confirm the exact chip string with: `probe-rs chip list | grep -i g431`
-# Nucleo-G431RB = STM32G431RBT6 -> STM32G431RBTx
-runner = "probe-rs run --chip STM32G431RBTx"
+# Confirm the exact chip string with: `probe-rs chip list | grep -i g474`
+# Nucleo-G474RE = STM32G474RET6 -> STM32G474RETx
+runner = "probe-rs run --chip STM32G474RETx"
 
 rustflags = [
   "-C", "link-arg=-Tlink.x",
