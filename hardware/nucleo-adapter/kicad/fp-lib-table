@@ -1,0 +1,12 @@
+(fp_lib_table
+	(version 7)
+	(lib (name "AdapterFootprints") (type "KiCad") (uri "${KIPRJMOD}/AdapterFootprints.pretty") (options "") (descr "Project-specific footprints copied from aartech-dev/RemoraNSR3.0"))
+	(lib (name "Package_DFN_QFN") (type "KiCad") (uri "${KICAD6_FOOTPRINT_DIR}/Package_DFN_QFN.pretty") (options "") (descr "KiCad standard library"))
+	(lib (name "Resistor_SMD") (type "KiCad") (uri "${KICAD6_FOOTPRINT_DIR}/Resistor_SMD.pretty") (options "") (descr "KiCad standard library"))
+	(lib (name "Capacitor_SMD") (type "KiCad") (uri "${KICAD6_FOOTPRINT_DIR}/Capacitor_SMD.pretty") (options "") (descr "KiCad standard library"))
+	(lib (name "Package_SO") (type "KiCad") (uri "${KICAD6_FOOTPRINT_DIR}/Package_SO.pretty") (options "") (descr "KiCad standard library"))
+	(lib (name "Package_TO_SOT_SMD") (type "KiCad") (uri "${KICAD6_FOOTPRINT_DIR}/Package_TO_SOT_SMD.pretty") (options "") (descr "KiCad standard library"))
+	(lib (name "Inductor_SMD") (type "KiCad") (uri "${KICAD6_FOOTPRINT_DIR}/Inductor_SMD.pretty") (options "") (descr "KiCad standard library"))
+	(lib (name "Connector_PinHeader_2.54mm") (type "KiCad") (uri "${KICAD6_FOOTPRINT_DIR}/Connector_PinHeader_2.54mm.pretty") (options "") (descr "KiCad standard library"))
+	(lib (name "TerminalBlock") (type "KiCad") (uri "${KICAD6_FOOTPRINT_DIR}/TerminalBlock.pretty") (options "") (descr "KiCad standard library"))
+)
