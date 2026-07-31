@@ -310,6 +310,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "stm32-hrtim"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b03714182b542eddce741890af19c584c4e59e8cc84d990a6a59db507da83b77"
+dependencies = [
+ "fugit",
+ "stm32g4",
+]
+
+[[package]]
 name = "stm32_os"
 version = "0.1.0"
 dependencies = [
@@ -354,6 +364,7 @@ dependencies = [
  "nb 1.1.0",
  "paste",
  "rand_core",
+ "stm32-hrtim",
  "stm32g4",
  "void",
 ]

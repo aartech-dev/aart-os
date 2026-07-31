@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 aart-core = { path = "../aart-core" }
-stm32g4xx-hal = { version = "0.1.0", features = ["stm32g431", "rt"] }
+stm32g4xx-hal = { version = "0.1.0", features = ["stm32g474", "rt"] }
 cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7.3"
 embedded-hal = "1.0.0"
@@ -32,11 +32,9 @@ bench = false
 name = "hal_test"
 harness = false
 
-# Debug builds of the stm32_os bin target no longer fit in 128K flash once
-# real logic (motor/sense/command drivers + aart-core's commutator) got
-# added - unoptimized embedded builds routinely don't fit on parts this
-# small. `cargo hw`/`cargo qemu` both run through `cargo test`, which builds
-# this bin target too (even though it's `test = false`), so this has to be
-# fixed here rather than by telling people to remember `--release`.
+# Kept even after the G474 retarget (512K flash, plenty of room): debug
+# builds are still meaningfully faster to flash/run at opt-level "s", and
+# `cargo hw`/`cargo qemu` both run through `cargo test`, which builds this
+# bin target too (even though it's `test = false`).
 [profile.dev]
 opt-level = "s"

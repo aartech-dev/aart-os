@@ -1,7 +1,8 @@
 MEMORY
 {
-  /* Nucleo-G431RB = STM32G431RBT6: 128 KB flash, 32 KB SRAM.
-     The previous value (64K flash) silently threw away half the part. */
-  FLASH : ORIGIN = 0x08000000, LENGTH = 128K
-  RAM   : ORIGIN = 0x20000000, LENGTH = 32K
+  /* Nucleo-G474RE = STM32G474RET6: 512 KB flash, 128 KB SRAM.
+     Retargeted from the G431RB (128K/32K) to pick up ADC3/ADC4 for
+     dedicated per-motor neutral sensing - see DESIGN.md section 6.1. */
+  FLASH : ORIGIN = 0x08000000, LENGTH = 512K
+  RAM   : ORIGIN = 0x20000000, LENGTH = 128K
 }

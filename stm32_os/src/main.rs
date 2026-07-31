@@ -22,6 +22,7 @@ use stm32g4xx_hal::rcc::{Config, PllConfig, PllMDiv, PllNMul, PllRDiv, PllSrc, R
 use stm32g4xx_hal::stm32::{interrupt, Interrupt};
 use stm32g4xx_hal::time::ExtU32;
 
+use aart_core::axle_balance::{front_rear_bias, AxleBalanceConfig};
 use aart_core::commutator::{
     floating_phase, step_pattern, Commutator, CommutatorConfig, RunPhase, ZeroCrossDetector,
 };
@@ -56,17 +57,18 @@ struct MotorIsrState<Br, S> {
     bridge: Br,
     sense: S,
     tick_extender: TickExtender,
-    /// Cycles through sampling the floating phase (most of the time),
-    /// neutral, and current on a fixed schedule - see step_motor. 16 is a
-    /// placeholder split (14/16 floating, 1/16 each of neutral/current),
-    /// not derived from real timing measurements.
+    /// Cycles between sampling the floating phase (most of the time) and
+    /// current on a fixed schedule - see step_motor. 16 is a placeholder
+    /// split (15/16 floating, 1/16 current), not derived from real timing
+    /// measurements. Neutral no longer needs a rotation slot at all: it has
+    /// its own dedicated free-running ADC (ADC3 for motor A, ADC4 for motor
+    /// B - see sense.rs), so a fresh reading is always available without
+    /// stealing a slot from phase/current sampling on ADC1/ADC2.
     rotation: u8,
-    latest_neutral: u16,
     latest_current: u16,
 }
 
 const ROTATION_LEN: u8 = 16;
-const NEUTRAL_SLOT: u8 = 0;
 const CURRENT_SLOT: u8 = 8;
 
 impl<Br, S> MotorIsrState<Br, S> {
@@ -78,7 +80,6 @@ impl<Br, S> MotorIsrState<Br, S> {
             sense,
             tick_extender: TickExtender::new(),
             rotation: 0,
-            latest_neutral: 0,
             latest_current: 0,
         }
     }
@@ -103,14 +104,13 @@ fn step_motor<Br: BridgeControl, S: SenseIsr>(state: &mut MotorIsrState<Br, S>) 
     let sample = state.sense.current_sample();
     state.sense.clear_eoc();
 
-    match state.rotation {
-        NEUTRAL_SLOT => state.latest_neutral = sample,
-        CURRENT_SLOT => state.latest_current = sample,
-        _ => {
-            let step = state.commutator.step();
-            if state.zero_cross.check(step, sample, state.latest_neutral) {
-                state.commutator.on_zero_cross(tick);
-            }
+    if state.rotation == CURRENT_SLOT {
+        state.latest_current = sample;
+    } else {
+        let step = state.commutator.step();
+        let neutral = state.sense.neutral_sample();
+        if state.zero_cross.check(step, sample, neutral) {
+            state.commutator.on_zero_cross(tick);
         }
     }
 
@@ -126,10 +126,10 @@ fn step_motor<Br: BridgeControl, S: SenseIsr>(state: &mut MotorIsrState<Br, S>) 
     }
 
     state.rotation = (state.rotation + 1) % ROTATION_LEN;
-    match state.rotation {
-        NEUTRAL_SLOT => state.sense.configure_neutral(),
-        CURRENT_SLOT => state.sense.configure_current(),
-        _ => state.sense.configure_phase(floating_phase(out.step)),
+    if state.rotation == CURRENT_SLOT {
+        state.sense.configure_current();
+    } else {
+        state.sense.configure_phase(floating_phase(out.step));
     }
     state.sense.rearm();
 }
@@ -156,10 +156,15 @@ fn ADC1_2() {
 
 // These are slot car motors: there is no throttle input, and once a motor
 // hands off to closed-loop it runs at this duty permanently (all volts/
-// current switched straight to the phases - "no PWM"). The differential
+// current switched straight to the phases - "no PWM"). The axle-balance
 // controller is the only thing that ever pulls duty below this, and only
-// for the cornering-slowed side. 1.0 = literally 100%.
+// for whichever axle it's biasing down. 1.0 = literally 100%.
 const RUNNING_BASE_DUTY: f32 = 1.0;
+
+// Front/rear feedforward gain (see aart_core::axle_balance) - a placeholder
+// pending real tuning against this chassis's actual wheelbase and turn
+// radii, same caveat as every other tunable below.
+const AXLE_BIAS_GAIN: f32 = 0.5;
 
 // All the numbers below are placeholders pending real tuning on an actual
 // 1106 motor/track - nothing here is derived from real motor characteristics
@@ -285,6 +290,10 @@ fn main() -> ! {
     );
 
     let adc_common = sense::claim_common(dp.ADC12_COMMON, &mut rcc);
+    // ADC3/ADC4 (dedicated free-running neutral sensing, one per motor) only
+    // exist once we retargeted from the G431 to the G474 - see sense.rs and
+    // DESIGN.md section 6.1.
+    let adc_common_345 = sense::claim_common_345(dp.ADC345_COMMON, &mut rcc);
     let mut delay = sense::CycleDelay::new(rcc.clocks.sys_clk.raw());
 
     let sense_a = sense::motor_a_sense(
@@ -293,9 +302,11 @@ fn main() -> ! {
         gpioa.pa0.into_analog(),
         gpioa.pa1.into_analog(),
         gpioa.pa3.into_analog(),
-        gpiob.pb1.into_analog(),
         gpiob.pb11.into_analog(),
         gpiob.pb12.into_analog(),
+        dp.ADC3,
+        &adc_common_345,
+        gpiob.pb1.into_analog(),
         &mut delay,
     );
 
@@ -305,8 +316,12 @@ fn main() -> ! {
         gpioa.pa4.into_analog(),
         gpioa.pa5.into_analog(),
         gpioa.pa6.into_analog(),
-        gpiob.pb2.into_analog(),
         gpiof.pf1.into_analog(),
+        dp.ADC4,
+        &adc_common_345,
+        // Was PB2 on the G431 (that pin has no ADC3/4/5 path at all - the
+        // one genuine new wiring change from the retarget, see DESIGN.md).
+        gpiob.pb14.into_analog(),
         &mut delay,
     );
 
@@ -362,9 +377,14 @@ fn main() -> ! {
     let mut last_freq_khz_a = motor::PWM_FREQUENCY_MIN_KHZ;
     let mut last_freq_khz_b = motor::PWM_FREQUENCY_MIN_KHZ;
 
-    // slip_threshold/slip_gain are placeholders pending real tuning on
-    // hardware, same as motor_commutator_config()'s sync numbers.
-    let mut diff_controller = DiffController::new(
+    // This is a 2-motor front/rear layout (motor A = front axle, motor B =
+    // rear axle, both solid-axle - no left/right split exists in hardware
+    // at all). slip_threshold/slip_gain are placeholders pending real
+    // tuning on hardware, same as motor_commutator_config()'s sync numbers.
+    // DiffController's mixing/slip-trim math doesn't care whether "a"/"b"
+    // are left/right or front/rear, only aart_core::axle_balance's
+    // feedforward (below) needs to know which - see DESIGN.md section 7.4.
+    let mut axle_controller = DiffController::new(
         DiffControllerConfig {
             slip_threshold: 0.05,
             slip_gain: 2.0,
@@ -374,7 +394,10 @@ fn main() -> ! {
     // steer_cmd is the only thing STEER actually changes here - THR is still
     // parsed (see the command loop below) but there is no throttle input on
     // real hardware (track voltage controls speed, not this device), so it
-    // has nothing to drive.
+    // has nothing to drive. Its sign (turn direction) doesn't reach
+    // axle_controller directly: front_rear_bias folds it to a magnitude-only,
+    // fixed-direction bias first (see the main loop) since front/rear
+    // balance, unlike left/right, doesn't flip with turn direction.
     let mut steer_cmd = 0.0f32;
     // Overwritten every tick before the (conditional, once-per-telemetry-
     // period) read below, so this initial value is never itself observed -
@@ -445,9 +468,14 @@ fn main() -> ! {
                     )
                 });
 
-            let diff_out = diff_controller.update(RUNNING_BASE_DUTY, steer_cmd, erpm_a, erpm_b);
-            with_motor(&MOTOR_A, |m| m.commutator.set_target_duty(diff_out.target_duty_a));
-            with_motor(&MOTOR_B, |m| m.commutator.set_target_duty(diff_out.target_duty_b));
+            // front_rear_bias turns the signed steer command into the
+            // magnitude-only, fixed-direction axle bias this layout actually
+            // needs (see aart_core::axle_balance and DESIGN.md section 7.4)
+            // before axle_controller's shared mixing/slip-trim math runs.
+            let axle_bias = front_rear_bias(steer_cmd, AxleBalanceConfig { bias_gain: AXLE_BIAS_GAIN });
+            let diff_out = axle_controller.update(RUNNING_BASE_DUTY, axle_bias, erpm_a, erpm_b);
+            with_motor(&MOTOR_A, |m| m.commutator.set_target_duty(diff_out.target_duty_a)); // front
+            with_motor(&MOTOR_B, |m| m.commutator.set_target_duty(diff_out.target_duty_b)); // rear
             last_slip_estimate = diff_out.slip_estimate;
 
             // PWM switching frequency tracks live speed throughout sync and

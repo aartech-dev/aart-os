@@ -1,7 +1,9 @@
 # aart-os — Design Document
 
 Status: draft v1 (2026-07-30)
-Target board: Nucleo-G431RB (STM32G431RBT6, Cortex-M4F, 128 KB flash / 32 KB SRAM)
+Target board: Nucleo-G474RE (STM32G474RET6, Cortex-M4F, 512 KB flash / 128 KB SRAM)
+— retargeted post-M6 from the original Nucleo-G431RB (STM32G431RBT6, 128 KB
+flash / 32 KB SRAM) for its extra ADC3/ADC4 peripherals; see §6.4.
 Language: Rust, `no_std` / `no_main`
 
 ## 1. What "single user operating system" means here
@@ -51,7 +53,8 @@ Worth stating explicitly, since the new work builds directly on it:
 
 - `stm32_os/` — firmware crate using `stm32g4xx-hal`, `cortex-m`,
   `cortex-m-rt`, `defmt`. Boots to `loop {}` today.
-- `stm32_os/memory.x` — correct FLASH/RAM layout for the RBT6 (128K/32K).
+- `stm32_os/memory.x` — correct FLASH/RAM layout, now for the G474RET6
+  (512K/128K) after the §6.4 retarget (was the G431RBT6's 128K/32K).
 - Three already-working test paths (this turns out to be exactly the test
   pyramid this design needs, see §4):
   - `cargo hw` — real hardware over `probe-rs` (safe default runner).
@@ -62,7 +65,11 @@ Worth stating explicitly, since the new work builds directly on it:
     (`rcc_shim.py`) that fakes clock-ready bits, because Renode ships no
     G4 platform at all. This is the more faithful emulator of the two
     (real G431 memory map, GPIO, two basic timers) and is where new
-    peripheral-level tests should land.
+    peripheral-level tests should land. Still G431-scoped even after the
+    §6.4 retarget to the G474 — Renode has no G474 platform either, so this
+    tier is stale pending someone porting the `.repl`/shims to the new
+    chip's register layout (not yet done; not currently blocking anything,
+    since tiers 1 and 3 cover the retarget work so far).
 
 This project already solved the annoying part (getting *anything* to boot
 under emulation for a chip Renode doesn't support). The new work is mostly
@@ -141,10 +148,12 @@ Behind small traits in `stm32_os`, backed initially by `stm32g4xx-hal`:
   timers with complementary outputs + break input, which is what a 3-phase
   bridge with high/low-side FETs needs (same choice ESCape32-class firmware
   makes on similar parts).
-- **ADC**: ADC1 for motor A, ADC2 for motor B (the G431 only has two ADC
-  peripherals total — see §6.2), triggered off each motor's PWM TRGO,
-  sampling phase voltage in the PWM off-time for BEMF zero-cross detection
-  (standard sensorless six-step technique).
+- **ADC**: ADC1 for motor A, ADC2 for motor B, triggered off each motor's
+  PWM TRGO, sampling phase voltage in the PWM off-time for BEMF zero-cross
+  detection (standard sensorless six-step technique). Since the retarget
+  to the G474 (§6.4), each motor's virtual-neutral node also gets its own
+  dedicated, continuously free-running ADC (ADC3/ADC4) instead of sharing
+  a rotation slot with phase/current sampling.
 - **UART**: USART1 on PB6/PB7 for the command/telemetry protocol — **not**
   USART2/PA2-PA3 (the Nucleo ST-Link VCOM pins) as originally assumed; see
   §6.2 for why.
@@ -222,9 +231,12 @@ With option 2, the full two-motor pin table becomes:
 | BEMF_A | PA0 | PA4 |
 | BEMF_B | PA1 | PA5 |
 | BEMF_C | PA3 | PA6 |
-| Neutral (virtual, resistor-summed) | PB1 | PB2 |
+| Neutral (virtual, resistor-summed) | PB1 | PB14 |
 | Current sense | PB11 | PF1 |
 | Bus voltage (shared, one reading is enough) | PB12 | — |
+
+(Motor B's neutral pin shown here already reflects the G474 retarget —
+see §6.4. It was PB2 on the original G431 plan.)
 
 Motor B's TIM8 pins were derived the same way — checked against the HAL's
 `TIM8` entry in `pins!`, filtered to the alternate-function options that
@@ -285,6 +297,68 @@ modeled by any generic Renode peripheral for G4 — expect to extend the
 exist in Renode's stock library. This is called out per-milestone below
 rather than solved up front — build the shim when the milestone that needs
 it arrives, same as was done for RCC.
+
+### 6.4 Retarget: STM32G474RE / Nucleo-G474RE (post-M6)
+
+Moved off the G431 to the bigger G473/G474/G483/G484 family, specifically
+**STM32G474RET6** on a **Nucleo-G474RE** board — same LQFP64 package and
+largely the same pinout as the Nucleo-G431RB used through M0–M6, but with
+512K flash / 128K RAM (vs. 128K/32K) and five ADCs (ADC1–5) instead of two.
+`Cargo.toml`'s `stm32g4xx-hal` feature and `memory.x`'s FLASH/RAM sizes were
+updated accordingly; the `stm32g474` feature auto-enables the crate's
+`adc3`/`adc4`/`adc5` features, so no separate feature flags were needed.
+
+**Motivation**: §6.1's option 2 (a per-motor virtual-neutral node) already
+decoupled the two motors' phase/current sensing onto ADC1/ADC2, but neutral
+itself still had to share each motor's single ADC via a time-multiplexed
+rotation (`NEUTRAL_SLOT`/`CURRENT_SLOT` in `main.rs`'s `step_motor`) — a
+real firmware complication and a source of latency/staleness in the neutral
+reference used for zero-cross detection. The G474's ADC3 and ADC4 let each
+motor's neutral node get its own dedicated ADC, free-running in continuous
+mode (`Continuous::Continuous`, no external trigger — see `sense.rs`), so a
+fresh neutral sample is always sitting in the data register with no
+rotation, no rearm, and no EOC interrupt bookkeeping needed for it.
+
+**Pin/wiring impact — verified against the vendored `stm32g4xx-hal-0.1.0`
+ADC pin tables (`src/adc/g4.rs`), which differ per chip feature**:
+
+- Motor A's neutral pin (**PB1**) is unchanged — on the G473/474/483/484,
+  PB1 maps to both ADC1 channel 12 (unused now) *and* ADC3 channel 1, so
+  the existing wiring just gets a new dedicated ADC without a new wire.
+- Motor B's neutral pin **moves from PB2 to PB14** — PB2 has no ADC3/4/5
+  route on this family at all, so a genuinely new wire is required. PB14
+  maps to ADC4 channel 4 (and ADC1 channel 5, unused). **This is the one
+  real hardware change from the retarget** — everything else (both
+  motors' TIM1/TIM8 PWM pins, both motors' BEMF/current/bus-voltage pins,
+  the USART1 command UART on PB6/PB7) carries over unchanged, verified by
+  cross-referencing ESCape32's own "STM32G431+" reference-hardware column
+  against pins already in use here.
+- ADC3 and ADC4 share one clock-config block, `ADC345_COMMON`, analogous
+  to `ADC12_COMMON` — claimed once in `main.rs` (`claim_common_345`) and
+  handed to both motors' sense setup by reference, same pattern as the
+  existing `ADC12_COMMON` claim.
+- §6.2's Nucleo solder-bridge conflicts (PA0/PA5/PA2-PA3) and their fixes
+  are unaffected — none of those pins changed.
+
+**Why not the G473/G483/G484 instead of G474**: all four share the same
+ADC layout relevant here (adc3/adc4/adc5 alike), so any would have worked
+for this specific problem. G474 (and G484) additionally have an HRTIM
+purpose-built for motor control, not yet used by this project but worth
+having available if TIM1/TIM8's resolution ever becomes limiting —
+picking the one Nucleo board (Nucleo-G474RE) that already exists off the
+shelf made this a low-cost option to keep open, not a commitment to use
+HRTIM now.
+
+**Renode**: no G474 (or G473/G483/G484) Renode platform exists any more
+than a G431 one did — `stm32g431.repl`/`adc_shim.py` remain G431-specific
+scratch work with no equivalent yet for this chip. This doesn't change
+§6.3's conclusion (Renode ADC/TIM1/TIM8 support has to be hand-built
+regardless of exact chip), it just means that work, whenever it happens,
+targets the new part's register layout instead of the old one. Real
+verification for this retarget so far is `cargo build --target
+thumbv7em-none-eabihf` (debug and release) against the real `stm32g474`
+feature, which catches pin/AF/ADC-channel mistakes at compile time even
+without Renode or real hardware.
 
 ## 7. Application modules (all in `aart-core`, hardware-agnostic)
 
@@ -362,13 +436,26 @@ actually changes anything once a motor is Running.
 
 ### 7.3 Electronic differential + slip estimate
 
+**Note on what "a"/"b" mean here**: `DiffController` itself is agnostic —
+its mixing math and BEMF slip trim only need *a* commanded ratio and each
+motor's eRPM, not what physically separates the two motors. In this
+project's actual 2-motor layout (motor A = front axle, motor B = rear
+axle, both solid-axle — see §7.4) it's used for **front/rear** balance, fed
+a feedforward from §7.4 rather than the raw UART `steer_cmd` directly.
+The description below is written in the original left/right framing this
+module was designed against, since that's still the clearer way to explain
+the mixing/slip-trim math itself; §7.4 covers what's different for
+front/rear.
+
 **Inputs**: `base_duty` (in practice always `sync_max_duty`, i.e. ~1.0 —
 there's no throttle command to vary it, see 7.1; kept as a parameter so
 this module doesn't need to know that convention and bench tests can still
-drive it directly), `steer_cmd` (from the UART protocol), `erpm_a`/`erpm_b`
-(from each `Commutator`, i.e. **electrical speed derived from BEMF timing,
-not a ground-truth wheel speed** — this was the chosen starting point, see
-the note below).
+drive it directly), `steer_cmd` (from the UART protocol — for this
+project's actual layout, `axle_balance::front_rear_bias(steer_cmd, ...)`'s
+output takes this parameter's place; see §7.4), `erpm_a`/`erpm_b` (from
+each `Commutator`, i.e. **electrical speed derived from BEMF timing, not a
+ground-truth wheel speed** — this was the chosen starting point, see the
+note below).
 
 **Output**: `target_duty_a`, `target_duty_b` — a skid-steer-style split,
 where `steer_cmd` biases one side down and the other up from `base_duty`.
@@ -394,6 +481,46 @@ without touching `diff_ctrl.rs`'s control loop.
 Host-tested with scripted `erpm_a`/`erpm_b` sequences, including an
 injected slip scenario (one erpm suddenly jumps relative to the other),
 asserting the controller cuts duty on the correct side.
+
+### 7.4 Front/rear axle balance (`aart-core::axle_balance`)
+
+This project's actual chassis is a **2-motor, solid-axle front/rear
+layout** (motor A drives the front axle, motor B drives the rear — not
+left/right; there is no per-side split in hardware at all, since each
+axle only has one motor). Front/rear still needs balancing in a turn, but
+the geometry differs from left/right in a way that matters for the
+control law, not just the labeling:
+
+- **Left/right** (§7.3's original framing): whichever side is on the
+  *outside* of the turn needs to run faster. The correction is symmetric
+  and flips sign with turn direction — `steer_cmd`'s sign does this
+  directly.
+- **Front/rear**: the front axle sweeps a longer arc than the rear axle in
+  *any* turn, left or right, because the yaw center sits behind the front
+  axle regardless of which way the car turns — the same reason real AWD
+  cars need a center differential or viscous coupling that only ever lets
+  the front overrun the rear, never the reverse. So the correction is a
+  function of steer **magnitude** only (how sharp the turn is), with a
+  **fixed sign** (always biases toward the front) — it must not flip with
+  `steer_cmd`'s sign the way left/right does.
+
+Rather than change `DiffController` itself (its mixing/slip-trim math
+doesn't need to know *why* the two motors should differ, only by how
+much), `axle_balance::front_rear_bias(steer_cmd, AxleBalanceConfig)`
+computes `-bias_gain * steer_cmd.abs()` (clamped to ±1) and feeds that
+into `DiffController::update` in place of the raw `steer_cmd` — `main.rs`
+wires this as a small feedforward stage in front of the existing
+mixing/BEMF-slip-trim machinery, both for the commanded-ratio mix itself
+and for what the slip estimator treats as the "no slip" target ratio.
+`bias_gain` (`AXLE_BIAS_GAIN` in `main.rs`) is a placeholder pending real
+tuning against this chassis's actual wheelbase and turn radii, same
+caveat as every other tunable gain in this project.
+
+Host-tested directly (`aart-core/src/axle_balance.rs`): zero steer gives
+zero bias, a left turn and a right turn of equal sharpness bias
+identically (unlike `DiffController`'s own steer-sign behavior), sharper
+turns bias harder, and zero gain disables the feedforward entirely
+(BEMF slip trim alone, no geometric prediction).
 
 ## 8. Milestones
 
@@ -520,6 +647,46 @@ Also had to move the ADC clock divider from HCLK/2 to HCLK/4
 Still unverified for the same reason as everything else here: no hardware
 to confirm the boost-mode transition and higher clock actually behave as
 the HAL's implementation (matching RM0440's documented sequence) intends.
+
+**Post-M6: retarget to STM32G474RE.** See §6.4 for the full pin-level
+detail; summarized here for the milestone history:
+
+- `Cargo.toml`'s `stm32g4xx-hal` feature moved from `stm32g431` to
+  `stm32g474` (auto-enabling the crate's `adc3`/`adc4`/`adc5` features);
+  `memory.x` updated from 128K/32K to 512K/128K.
+- `sense.rs` gained a dedicated, continuously free-running ADC per motor
+  for virtual-neutral sensing (ADC3 for motor A reusing the existing PB1
+  pin, ADC4 for motor B on a new PB14 pin — PB2, the old neutral pin, has
+  no ADC3/4/5 route on this family at all) via a new `ADC345_COMMON` claim
+  and a new `SenseIsr::neutral_sample()` method.
+- `main.rs`'s ISR rotation (`step_motor`) simplified from a 3-way split
+  (floating-phase/neutral/current) to 2-way (floating-phase/current) —
+  `NEUTRAL_SLOT` and the `latest_neutral` cache are gone; the fast path
+  just reads `sense.neutral_sample()` directly every firing, since that
+  ADC never stops converting.
+- Verified via `cargo build --target thumbv7em-none-eabihf` (debug and
+  release) against the real `stm32g474` feature — no hardware or Renode
+  model exists for this chip either (§6.3), so compile-time pin/AF/ADC-
+  channel checking is the verification ceiling here, same as it was for
+  the G431. All 66 `aart-core` host tests still pass unchanged, since none
+  of this touched hardware-agnostic logic.
+
+**Post-G474-retarget: front/rear axle balance.** Clarified that this
+project's actual chassis is a 2-motor front/rear layout (motor A = front
+axle, motor B = rear axle, both solid-axle), not left/right — no hardware
+change from this (still the same 2 motors, same G474 PWM/ADC allocation),
+but the control law needed a new piece: see §7.4 for the full reasoning.
+Summary: new `aart-core::axle_balance` module (`front_rear_bias`, 5 host
+tests) maps the signed `steer_cmd` to a magnitude-only, fixed-direction
+bias, because unlike left/right — where the correction flips sign with
+turn direction — the front axle sweeps a longer path than the rear in any
+turn, so the bias must not flip. `DiffController` itself needed no
+changes; `main.rs` just feeds `front_rear_bias`'s output into it instead of
+raw `steer_cmd` (renamed `diff_controller` to `axle_controller` for
+clarity). New `AXLE_BIAS_GAIN` constant, same placeholder caveat as every
+other tunable. Verified: 71 `aart-core` host tests pass (66 + 5 new), and
+`stm32_os` builds cleanly (debug + release, real `stm32g474` feature) with
+no warnings.
 
 ## 9. Open questions (not blocking M0, but worth revisiting)
 
