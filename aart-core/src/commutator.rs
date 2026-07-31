@@ -123,12 +123,32 @@ pub fn floating_phase(step: u8) -> Phase {
     }
 }
 
+/// Which step comes after `step` given the configured spin direction -
+/// forward (1→2→3→4→5→6→1) normally, backward (1→6→5→4→3→2→1) when
+/// `reverse` is set. Reversing which way `STEP_TABLE` is cycled is what
+/// actually reverses which way the motor spins - see `CommutatorConfig::
+/// reverse` (ESCape32's `revdir`).
+fn next_step_index(step: u8, reverse: bool) -> u8 {
+    if reverse {
+        if step == 1 {
+            6
+        } else {
+            step - 1
+        }
+    } else if step == 6 {
+        1
+    } else {
+        step + 1
+    }
+}
+
 /// Whether the floating phase should cross neutral rising (low-to-high) or
 /// falling during `step`, derived from `STEP_TABLE` itself (the phase that
 /// floats now is the one the *next* step drives - rising if that's a High).
-fn expected_rising_edge(step: u8) -> bool {
-    let next_step = if step == 6 { 1 } else { step + 1 };
-    let next = step_pattern(next_step);
+/// `reverse` must match whatever direction `Commutator` is actually
+/// stepping in, since "next" means something different in each direction.
+fn expected_rising_edge(step: u8, reverse: bool) -> bool {
+    let next = step_pattern(next_step_index(step, reverse));
     match floating_phase(step) {
         Phase::A => next.a == PhaseState::High,
         Phase::B => next.b == PhaseState::High,
@@ -159,10 +179,12 @@ impl ZeroCrossDetector {
 
     /// `floating_sample`/`neutral_sample` are raw ADC counts for the
     /// currently-floating phase (see `floating_phase`) and the virtual
-    /// neutral node, sampled at the same instant. Returns true exactly on
-    /// the sample where the reading crosses neutral in the expected
-    /// direction for `step`.
-    pub fn check(&mut self, step: u8, floating_sample: u16, neutral_sample: u16) -> bool {
+    /// neutral node, sampled at the same instant. `reverse` must match the
+    /// `Commutator` this feeds (`CommutatorConfig::reverse`) - it changes
+    /// which direction counts as "expected" for a given step. Returns true
+    /// exactly on the sample where the reading crosses neutral in the
+    /// expected direction for `step`.
+    pub fn check(&mut self, step: u8, floating_sample: u16, neutral_sample: u16, reverse: bool) -> bool {
         let positive = floating_sample >= neutral_sample;
 
         // A different step means a different physical phase (and a
@@ -176,7 +198,7 @@ impl ZeroCrossDetector {
 
         let previous = self.last_sample_positive.replace(positive);
         match previous {
-            Some(prev) if prev != positive => positive == expected_rising_edge(step),
+            Some(prev) if prev != positive => positive == expected_rising_edge(step, reverse),
             _ => false,
         }
     }
@@ -224,6 +246,21 @@ pub struct CommutatorConfig {
     /// of `sync_max_duty`/the differential controller's output, since this
     /// is a dead-short chop ratio, not a commutation duty.
     pub drag_brake_duty: f32,
+    /// Commutation timing advance, 0-31 - ESCape32's `timing`. 0 commutates
+    /// exactly at the BEMF-implied midpoint (`period / 2` after the last
+    /// zero-cross, this module's long-standing default); higher values
+    /// commutate progressively earlier, following ESCape32's own formula
+    /// (`main.c`'s `IFTIM_OCR`: delay = `period * (32 - timing) / 64`) -
+    /// ported here rather than re-derived, so behavior matches a firmware
+    /// this technique is already field-proven on. Values above 31 are
+    /// clamped defensively (see `on_zero_cross`), not rejected - validation
+    /// against the documented 0-31 range is `aart_core::params`'s job.
+    pub timing: u8,
+    /// Reverses commutation direction (`STEP_TABLE` cycles backward
+    /// instead of forward) - ESCape32's `revdir`. Which way the motor
+    /// physically spins for the same commanded rotation depends on this
+    /// matching how it's actually wired in.
+    pub reverse: bool,
 }
 
 /// Ticks between consecutive zero-crossings (1/6 of an electrical
@@ -272,6 +309,24 @@ impl Commutator {
 
     pub fn step(&self) -> u8 {
         self.step
+    }
+
+    /// Which direction this instance is currently commutating - callers
+    /// feeding `ZeroCrossDetector::check` need this, since it changes
+    /// which crossing direction counts as "expected" for a given step.
+    pub fn reverse(&self) -> bool {
+        self.config.reverse
+    }
+
+    /// Direct mutable access to the live config - lets a caller retune
+    /// sync/drag-brake/timing/direction parameters
+    /// (`aart_core::params`, over UART) without reconstructing the whole
+    /// `Commutator` and losing its current sync/BEMF state. Every field
+    /// here is read fresh each `poll()`/`on_zero_cross()` call, so a
+    /// change here takes effect on the very next one, not just after a
+    /// resync.
+    pub fn config_mut(&mut self) -> &mut CommutatorConfig {
+        &mut self.config
     }
 
     /// Sets the duty the Running phase applies (the differential controller
@@ -354,7 +409,12 @@ impl Commutator {
             if period > 0 && !looks_like_a_missed_beat {
                 self.period_estimate = Some(period);
                 self.period_estimate_trusted = true;
-                self.next_commutation = Some(tick + period / 2);
+                // ESCape32's timing-advance formula (see CommutatorConfig::
+                // timing's doc comment) - clamped to 32 defensively so an
+                // out-of-spec value can't underflow this subtraction.
+                let timing = (self.config.timing as u64).min(32);
+                let delay = period * (32 - timing) / 64;
+                self.next_commutation = Some(tick + delay);
             }
         }
 
@@ -362,7 +422,7 @@ impl Commutator {
     }
 
     fn advance_step(&mut self) {
-        self.step = if self.step == 6 { 1 } else { self.step + 1 };
+        self.step = next_step_index(self.step, self.config.reverse);
     }
 
     /// Call every tick; advances the step when the scheduled commutation
@@ -517,6 +577,8 @@ mod tests {
             sync_ramp_erpm_per_step: 100,
             stall_multiplier: 3,
             drag_brake_duty: 0.6,
+            timing: 0,
+            reverse: false,
         }
     }
 
@@ -760,7 +822,7 @@ mod tests {
         let expected = [false, true, false, true, false, true];
         for step in 1..=6u8 {
             assert_eq!(
-                expected_rising_edge(step),
+                expected_rising_edge(step, false),
                 expected[(step - 1) as usize],
                 "step {step}"
             );
@@ -782,15 +844,15 @@ mod tests {
         let mut d = ZeroCrossDetector::new();
         // Step 2 expects a rising edge; starting below neutral shouldn't
         // fire just because there's no prior reference yet.
-        assert!(!d.check(2, 1000, 2048));
+        assert!(!d.check(2, 1000, 2048, false));
     }
 
     #[test]
     fn zero_cross_detector_fires_on_the_expected_direction() {
         let mut d = ZeroCrossDetector::new();
-        assert!(!d.check(2, 1000, 2048)); // below neutral, establishes reference
-        assert!(!d.check(2, 1500, 2048)); // still below neutral, no crossing
-        assert!(d.check(2, 2500, 2048)); // crosses above -> rising, as expected for step 2
+        assert!(!d.check(2, 1000, 2048, false)); // below neutral, establishes reference
+        assert!(!d.check(2, 1500, 2048, false)); // still below neutral, no crossing
+        assert!(d.check(2, 2500, 2048, false)); // crosses above -> rising, as expected for step 2
     }
 
     #[test]
@@ -798,28 +860,28 @@ mod tests {
         let mut d = ZeroCrossDetector::new();
         // Step 1 expects a falling edge (see expected_rising_edge_alternates_per_step);
         // a rising crossing is noise, not a valid commutation event.
-        assert!(!d.check(1, 1000, 2048)); // below neutral, establishes reference
-        assert!(!d.check(1, 1500, 2048)); // still below, no crossing
-        assert!(!d.check(1, 2500, 2048)); // crosses above -> rising, wrong direction for step 1
+        assert!(!d.check(1, 1000, 2048, false)); // below neutral, establishes reference
+        assert!(!d.check(1, 1500, 2048, false)); // still below, no crossing
+        assert!(!d.check(1, 2500, 2048, false)); // crosses above -> rising, wrong direction for step 1
     }
 
     #[test]
     fn zero_cross_detector_fires_on_a_falling_edge_when_expected() {
         let mut d = ZeroCrossDetector::new();
         // Step 1 expects a falling edge.
-        assert!(!d.check(1, 2500, 2048)); // above neutral, establishes reference
-        assert!(!d.check(1, 3000, 2048)); // still above, no crossing
-        assert!(d.check(1, 1000, 2048)); // crosses below -> falling, as expected for step 1
+        assert!(!d.check(1, 2500, 2048, false)); // above neutral, establishes reference
+        assert!(!d.check(1, 3000, 2048, false)); // still above, no crossing
+        assert!(d.check(1, 1000, 2048, false)); // crosses below -> falling, as expected for step 1
     }
 
     #[test]
     fn zero_cross_detector_resets_reference_on_step_change() {
         let mut d = ZeroCrossDetector::new();
-        assert!(!d.check(1, 2500, 2048)); // above neutral on step 1
+        assert!(!d.check(1, 2500, 2048, false)); // above neutral on step 1
         // Step changes to 2 before a crossing was ever seen on step 1 - the
         // old "above neutral" reading must not be compared against step 2's
         // first sample even though it's now below neutral.
-        assert!(!d.check(2, 1000, 2048));
+        assert!(!d.check(2, 1000, 2048, false));
     }
 
     // M3: two motors, each with its own Commutator/ZeroCrossDetector - these
@@ -865,12 +927,12 @@ mod tests {
         let mut b = ZeroCrossDetector::new();
 
         // Establish a's reference on step 1 (expects falling).
-        assert!(!a.check(1, 2500, 2048));
+        assert!(!a.check(1, 2500, 2048, false));
         // b, on a *different* step (2, expects rising) with an unrelated
         // sample sequence, must not be influenced by a's internal state.
-        assert!(!b.check(2, 1000, 2048));
-        assert!(b.check(2, 2500, 2048)); // b's own rising crossing fires...
-        assert!(a.check(1, 1000, 2048)); // ...independently of a's falling crossing firing here.
+        assert!(!b.check(2, 1000, 2048, false));
+        assert!(b.check(2, 2500, 2048, false)); // b's own rising crossing fires...
+        assert!(a.check(1, 1000, 2048, false)); // ...independently of a's falling crossing firing here.
     }
 
     #[test]
@@ -917,6 +979,123 @@ mod tests {
         c.engage_drag_brake();
         c.poll(start + 1);
         assert_eq!(c.current_erpm(), 0);
+    }
+
+    #[test]
+    fn zero_timing_commutates_at_exactly_half_period_after_zero_cross() {
+        // timing=0 is the module's original, long-standing behavior -
+        // this pins that down explicitly rather than relying only on the
+        // other Running-phase tests (which all use test_config()'s
+        // timing: 0 implicitly).
+        let (mut c, start) = spun_up();
+        let period = 1000u64;
+        // First real zero-cross only establishes a reference point (same
+        // reasoning as steady_period_commutates_at_half_period_after_each_zero_cross) -
+        // the second is what yields a clean, exactly-`period`-long interval.
+        c.on_zero_cross(start + 200);
+        let zc = start + 200 + period;
+        c.on_zero_cross(zc);
+        let commutation_tick = zc + period / 2;
+        let step_before = c.poll(commutation_tick - 1).step;
+        let out = c.poll(commutation_tick);
+        assert_eq!(out.step, if step_before == 6 { 1 } else { step_before + 1 });
+    }
+
+    #[test]
+    fn maximum_timing_advance_commutates_much_earlier() {
+        // Sync with the proven timing=0 path first (spun_up()'s own fake
+        // zero-crosses would otherwise interact with an already-active
+        // timing advance in confusing ways - e.g. the ramp-to-Running
+        // handoff tick can itself coincide with a fake zero-cross, and a
+        // sudden very-short timing-advanced period right at that instant
+        // can trip the missed-beat rejection against whatever the *next*
+        // real period turns out to be). Flipping `timing` only after
+        // Running is established with a clean period keeps this test
+        // focused on just the one thing it's checking.
+        let (mut c, start) = spun_up();
+        c.config_mut().timing = 31;
+
+        let period = 1000u64;
+        // First real zero-cross only establishes a reference point - see
+        // zero_timing_commutates_at_exactly_half_period_after_zero_cross.
+        c.on_zero_cross(start + 200);
+        let zc = start + 200 + period;
+        c.on_zero_cross(zc);
+        // delay = period * (32-31) / 64 = period/64, far earlier than the
+        // timing=0 default's period/2 - confirm the step has *already*
+        // advanced well before the old period/2 deadline would fire.
+        let step_before = c.step();
+        let out = c.poll(zc + period / 64 + 1);
+        assert_ne!(out.step, step_before, "should have already commutated");
+        let out_at_old_deadline = c.poll(zc + period / 2);
+        assert_eq!(
+            out_at_old_deadline.step, out.step,
+            "shouldn't commutate a second time by the old period/2 point"
+        );
+    }
+
+    #[test]
+    fn reverse_steps_backward_through_the_table() {
+        let mut cfg = test_config();
+        cfg.reverse = true;
+        let mut c = Commutator::new(cfg);
+        assert_eq!(c.step(), 1);
+        assert!(c.reverse());
+
+        // Drive the open-loop ramp forward in time (poll always advances
+        // by scheduled deadline, regardless of direction) and confirm the
+        // step sequence goes 1 -> 6 -> 5 -> ..., not 1 -> 2 -> 3.
+        let mut tick = 0u64;
+        let mut steps = Vec::new();
+        steps.push(c.step());
+        for _ in 0..5 {
+            loop {
+                tick += 1;
+                let out = c.poll(tick);
+                if out.step != *steps.last().unwrap() {
+                    steps.push(out.step);
+                    break;
+                }
+            }
+        }
+        assert_eq!(steps, [1, 6, 5, 4, 3, 2]);
+    }
+
+    #[test]
+    fn expected_rising_edge_reverses_with_direction() {
+        // Forward and reverse must disagree for the *same* step, since
+        // "next" points at a different physical step in each direction.
+        for step in 1..=6u8 {
+            assert_ne!(
+                expected_rising_edge(step, false),
+                expected_rising_edge(step, true),
+                "step {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_cross_detector_reverse_flag_flips_the_expected_direction() {
+        let mut fwd = ZeroCrossDetector::new();
+        let mut rev = ZeroCrossDetector::new();
+        // Step 2 rises going forward (see expected_rising_edge_alternates_per_step);
+        // the same physical rising crossing must be rejected in reverse.
+        assert!(!fwd.check(2, 1000, 2048, false));
+        assert!(fwd.check(2, 2500, 2048, false));
+        assert!(!rev.check(2, 1000, 2048, true));
+        assert!(!rev.check(2, 2500, 2048, true));
+    }
+
+    #[test]
+    fn config_mut_lets_drag_brake_duty_change_live() {
+        let (mut c, start) = spun_up();
+        c.engage_drag_brake();
+        let out = c.poll(start + 1);
+        assert!(approx(out.duty, test_config().drag_brake_duty));
+
+        c.config_mut().drag_brake_duty = 0.9;
+        let out = c.poll(start + 2);
+        assert!(approx(out.duty, 0.9), "should reflect the new duty immediately");
     }
 
     #[test]

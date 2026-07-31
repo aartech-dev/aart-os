@@ -2,6 +2,7 @@
 #![no_main]
 
 mod command;
+mod config_store;
 mod motor;
 mod sense;
 
@@ -15,6 +16,7 @@ use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m::peripheral::DWT;
 use cortex_m_rt::{entry, exception};
 
+use stm32g4xx_hal::flash::FlashExt;
 use stm32g4xx_hal::gpio::GpioExt;
 use stm32g4xx_hal::independent_watchdog::IndependentWatchdog;
 use stm32g4xx_hal::pwr::PwrExt;
@@ -29,7 +31,8 @@ use aart_core::commutator::{
 use aart_core::diff_ctrl::{BemfSlipEstimator, DiffController, DiffControllerConfig};
 use aart_core::drive_layout::DriveLayout;
 use aart_core::fault::{FaultConfig, FaultSupervisor};
-use aart_core::protocol::{format_error, format_telemetry, parse_line, Command, LineReader};
+use aart_core::params::Params;
+use aart_core::protocol::{format_error, format_param, format_telemetry, parse_line, Command, LineReader};
 use aart_core::scheduler::Scheduler;
 use aart_core::tick::TickExtender;
 use motor::BridgeControl;
@@ -125,7 +128,8 @@ fn step_motor<Br: BridgeControl, S: SenseIsr>(state: &mut MotorIsrState<Br, S>) 
     } else if state.commutator.phase() != RunPhase::Braking {
         let step = state.commutator.step();
         let neutral = state.sense.neutral_sample();
-        if state.zero_cross.check(step, sample, neutral) {
+        let reverse = state.commutator.reverse();
+        if state.zero_cross.check(step, sample, neutral, reverse) {
             state.commutator.on_zero_cross(tick);
         }
     }
@@ -202,10 +206,12 @@ const AXLE_BIAS_GAIN: f32 = 0.5;
 
 // Drag brake ("Latvian brake", see aart_core::brake and DESIGN.md section
 // 7.5) - placeholders pending real tuning, same caveat as everything else
-// below. DUTY is how hard Bridge::brake chops the winding short, not a
-// commutation duty; DEBOUNCE_TICKS is how many consecutive main-loop ticks
-// (1kHz, see TICK_HZ) the shared track-current reading must stay collapsed
-// before engaging, to reject a single noisy/glitched reading.
+// below. The chop duty itself is `params.duty_drag` now (GET/SET/SAVE over
+// UART, see aart_core::params and DESIGN.md section 7.7) - DEBOUNCE_TICKS
+// stays a fixed build-time constant (not exposed): how many consecutive
+// main-loop ticks (1kHz, see TICK_HZ) the shared track-current reading
+// must stay collapsed before engaging, to reject a single noisy/glitched
+// reading.
 //
 // The shared track-current amplifier (DESIGN.md 6.5) is bidirectional:
 // positive current while driving/accelerating, negative under braking/
@@ -214,8 +220,7 @@ const AXLE_BIAS_GAIN: f32 = 0.5;
 // amplifier's reference design, unverified against real hardware) and
 // MIN_TRACK_CURRENT_MAGNITUDE is how far from that offset (in either
 // direction, see aart_core::brake::current_present) a reading needs to be
-// to still count as "current present."
-const DRAG_BRAKE_DUTY: f32 = 0.6;
+// to still count as "current present." Neither is exposed over UART yet.
 const DRAG_BRAKE_DEBOUNCE_TICKS: u16 = 5;
 const TRACK_CURRENT_ZERO_OFFSET: u16 = 2_048;
 const MIN_TRACK_CURRENT_MAGNITUDE: u16 = 50;
@@ -238,29 +243,65 @@ const TOP_RUNNING_ERPM: u32 = 150_000;
 /// before), not assumed as a constant, since Commutator's whole timing
 /// model (period_ticks_for_erpm, electrical_rpm, stall windows) is only
 /// correct if this actually matches what the DWT is really counting at.
-fn motor_commutator_config(core_hz: u32) -> CommutatorConfig {
+///
+/// `timing`/`reverse` are passed in separately (rather than read directly
+/// off `params`) since they're the two fields that differ per motor
+/// (`params.timing_a`/`revdir_a` vs `timing_b`/`revdir_b`) - everything
+/// else here is shared between both motors' configs.
+fn motor_commutator_config(core_hz: u32, params: &Params, timing: u8, reverse: bool) -> CommutatorConfig {
     CommutatorConfig {
         tick_hz: core_hz,
         sync_start_erpm: SYNC_START_ERPM,
         sync_target_erpm: SYNC_TARGET_ERPM,
-        sync_start_duty: 0.15,
+        sync_start_duty: params.duty_spup as f32 / 100.0,
         sync_max_duty: RUNNING_BASE_DUTY,
-        sync_ramp_erpm_per_step: 500,
+        sync_ramp_erpm_per_step: params.duty_ramp as u32,
         stall_multiplier: 8,
-        drag_brake_duty: DRAG_BRAKE_DUTY,
+        drag_brake_duty: params.duty_drag as f32 / 100.0,
+        timing,
+        reverse,
     }
 }
 
-/// PWM switching-frequency schedule: 48kHz at SYNC_START_ERPM, 96kHz by
-/// TOP_RUNNING_ERPM, linear in between (extends past the sync ramp itself,
-/// continuing to track real running speed once Running).
-fn pwm_frequency_schedule() -> aart_core::commutator::PwmFrequencySchedule {
+/// PWM switching-frequency schedule: `params.freq_min` at SYNC_START_ERPM,
+/// `params.freq_max` by TOP_RUNNING_ERPM, linear in between (extends past
+/// the sync ramp itself, continuing to track real running speed once
+/// Running). Built fresh from `params` at each call site (cheap - a plain
+/// struct, no allocation) rather than cached, so a live `SET freq_min`/
+/// `freq_max` takes effect on the very next tick.
+fn pwm_frequency_schedule(params: &Params) -> aart_core::commutator::PwmFrequencySchedule {
     aart_core::commutator::PwmFrequencySchedule {
         min_erpm: SYNC_START_ERPM,
         max_erpm: TOP_RUNNING_ERPM,
-        min_khz: motor::PWM_FREQUENCY_MIN_KHZ,
-        max_khz: motor::PWM_FREQUENCY_MAX_KHZ,
+        min_khz: params.freq_min as u32,
+        max_khz: params.freq_max as u32,
     }
+}
+
+/// Pushes every live-tunable field from `params` into both motors' running
+/// `Commutator`s - called once after any successful `SET` (see the command
+/// loop below) so a change takes effect immediately rather than only after
+/// the next resync. Reapplies all fields unconditionally rather than
+/// dispatching on which single field changed - simpler, and cheap enough
+/// to not matter given this only ever runs on an operator-triggered `SET`,
+/// not every tick.
+fn apply_params(params: &Params) {
+    with_motor(&MOTOR_A, |m| {
+        let cfg = m.commutator.config_mut();
+        cfg.sync_start_duty = params.duty_spup as f32 / 100.0;
+        cfg.sync_ramp_erpm_per_step = params.duty_ramp as u32;
+        cfg.drag_brake_duty = params.duty_drag as f32 / 100.0;
+        cfg.timing = params.timing_a;
+        cfg.reverse = params.revdir_a;
+    });
+    with_motor(&MOTOR_B, |m| {
+        let cfg = m.commutator.config_mut();
+        cfg.sync_start_duty = params.duty_spup as f32 / 100.0;
+        cfg.sync_ramp_erpm_per_step = params.duty_ramp as u32;
+        cfg.drag_brake_duty = params.duty_drag as f32 / 100.0;
+        cfg.timing = params.timing_b;
+        cfg.reverse = params.revdir_b;
+    });
 }
 
 // SysTick still drives the slow cyclic-executive-ish loop (UART, telemetry,
@@ -311,6 +352,15 @@ fn main() -> ! {
         .boost(true);
     let mut rcc = dp.RCC.freeze(rcc_cfg, pwr_cfg);
     let core_hz = rcc.clocks.sys_clk.raw();
+
+    // Load persisted tunables (PWM frequencies, sync/drag-brake duty,
+    // per-motor timing advance/direction - see aart_core::params and
+    // DESIGN.md section 7.7) before anything that needs them is built
+    // below. Falls back to Params::defaults() if nothing's ever been
+    // saved. `flash_parts` stays alive for the rest of main() so the
+    // command loop's SAVE handling can write back to the same page later.
+    let mut flash_parts = dp.FLASH.constrain();
+    let mut params = config_store::load(&mut flash_parts);
 
     let gpioa = dp.GPIOA.split(&mut rcc);
     let gpiob = dp.GPIOB.split(&mut rcc);
@@ -406,12 +456,12 @@ fn main() -> ! {
     // thing actually worth asserting about "M3".
     free(|cs| {
         MOTOR_A.borrow(cs).replace(Some(MotorAState::new(
-            Commutator::new(motor_commutator_config(core_hz)),
+            Commutator::new(motor_commutator_config(core_hz, &params, params.timing_a, params.revdir_a)),
             bridge_a,
             sense_a,
         )));
         MOTOR_B.borrow(cs).replace(Some(MotorBState::new(
-            Commutator::new(motor_commutator_config(core_hz)),
+            Commutator::new(motor_commutator_config(core_hz, &params, params.timing_b, params.revdir_b)),
             bridge_b,
             sense_b,
         )));
@@ -434,10 +484,12 @@ fn main() -> ! {
         cortex_m::peripheral::NVIC::unmask(Interrupt::ADC1_2);
     }
 
-    let pwm_schedule = pwm_frequency_schedule();
     // Track the last frequency actually written per motor so set_frequency_hz
     // (a real PSC/ARR rewrite + duty rescale) only runs when the schedule's
-    // output actually changes, not every single tick regardless.
+    // output actually changes, not every single tick regardless. The
+    // schedule itself isn't cached (see pwm_frequency_schedule) - it's
+    // rebuilt from `params` fresh each tick, so a live SET freq_min/freq_max
+    // takes effect immediately.
     let mut last_freq_khz_a = motor::PWM_FREQUENCY_MIN_KHZ;
     let mut last_freq_khz_b = motor::PWM_FREQUENCY_MIN_KHZ;
 
@@ -469,7 +521,6 @@ fn main() -> ! {
     // DESIGN.md section 6.5), not either motor's own draw. See
     // aart_core::brake and DESIGN.md section 7.5.
     let mut drag_brake = DragBrakeSupervisor::new(DragBrakeConfig {
-        duty: DRAG_BRAKE_DUTY,
         debounce_ticks: DRAG_BRAKE_DEBOUNCE_TICKS,
     });
     // Overwritten every tick before the (conditional, once-per-telemetry-
@@ -596,6 +647,7 @@ fn main() -> ! {
             // PWM switching frequency tracks live speed throughout sync and
             // running (current_erpm, not electrical_rpm, so it's live
             // during the open-loop ramp too, not just once BEMF is trusted).
+            let pwm_schedule = pwm_frequency_schedule(&params);
             let freq_khz_a = pwm_schedule.frequency_khz(current_erpm_a);
             if freq_khz_a != last_freq_khz_a {
                 with_motor(&MOTOR_A, |m| m.bridge.set_frequency_hz(freq_khz_a * 1_000));
@@ -667,6 +719,44 @@ fn main() -> ! {
                     // bench testing without a real track/motors.
                     Ok(Command::Throttle(_)) => {}
                     Ok(Command::Steer(v)) => steer_cmd = v,
+                    // GET/SET/SAVE - runtime parameter access, persisted to
+                    // flash (aart_core::params, DESIGN.md section 7.7).
+                    // Parameter names are copied from ESCape32's own config
+                    // (freq_min/freq_max/duty_spup/duty_ramp/duty_drag/
+                    // timing_a-b/revdir_a-b).
+                    Ok(Command::Get(name)) => match aart_core::params::get(&params, name) {
+                        Ok(value) => {
+                            let n = format_param(&mut response_buf, name, value);
+                            command.write(&response_buf[..n]);
+                        }
+                        Err(e) => {
+                            let n = format_error(e, &mut response_buf);
+                            command.write(&response_buf[..n]);
+                        }
+                    },
+                    Ok(Command::Set(name, value)) => match aart_core::params::set(&mut params, name, value) {
+                        Ok(applied) => {
+                            // Pushes the new value into the live Commutators
+                            // immediately - see apply_params's doc comment.
+                            apply_params(&params);
+                            let n = format_param(&mut response_buf, name, applied);
+                            command.write(&response_buf[..n]);
+                        }
+                        Err(e) => {
+                            let n = format_error(e, &mut response_buf);
+                            command.write(&response_buf[..n]);
+                        }
+                    },
+                    Ok(Command::Save) => {
+                        // Briefly stalls ADC1_2 (a flash-page erase/write) -
+                        // see config_store.rs's module doc comment for why
+                        // that's an accepted, not engineered-around, cost.
+                        if config_store::save(&mut flash_parts, &params) {
+                            command.write(b"SAVE=1 OK\r\n");
+                        } else {
+                            command.write(b"ERR save failed\r\n");
+                        }
+                    }
                     Err(e) => {
                         let n = format_error(e, &mut response_buf);
                         command.write(&response_buf[..n]);

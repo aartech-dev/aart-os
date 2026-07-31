@@ -14,9 +14,20 @@
 use core::fmt::Write as _;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Command {
+pub enum Command<'a> {
     Throttle(f32),
     Steer(f32),
+    /// `GET <param>` - the parameter name borrows from the input line, so
+    /// this carries a lifetime now. Whether `<param>` is actually a
+    /// recognized name is `aart_core::params`'s concern, not this parser's
+    /// - this only validates line *syntax*.
+    Get(&'a str),
+    /// `SET <param> <value>` - `value` is a plain integer (unlike
+    /// `Throttle`/`Steer`'s floats), since every parameter
+    /// `aart_core::params` exposes is integer-valued (percentages, kHz,
+    /// a 0-31 timing code, a 0/1 bool).
+    Set(&'a str, i32),
+    Save,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +40,11 @@ pub enum ParseError {
     /// motor-control channel.
     InvalidValue,
     OutOfRange,
+    /// `GET`/`SET` named a parameter `aart_core::params` doesn't recognize.
+    /// A distinct variant from `UnknownCommand` (the command *verb* itself
+    /// wasn't recognized) since the failure points are different for an
+    /// operator debugging a typo.
+    UnknownParam,
 }
 
 const THROTTLE_RANGE: core::ops::RangeInclusive<f32> = 0.0..=1.0;
@@ -36,33 +52,54 @@ const STEER_RANGE: core::ops::RangeInclusive<f32> = -1.0..=1.0;
 
 /// Parses one already-delimited line (no terminator). Use `LineReader` to
 /// get there from a raw byte stream.
-pub fn parse_line(line: &str) -> Result<Command, ParseError> {
+pub fn parse_line(line: &str) -> Result<Command<'_>, ParseError> {
     let line = line.trim();
     let mut tokens = line.split_whitespace();
-
     let keyword = tokens.next().ok_or(ParseError::Empty)?;
+
+    match keyword {
+        "THR" => parse_float_arg(tokens, THROTTLE_RANGE).map(Command::Throttle),
+        "STEER" => parse_float_arg(tokens, STEER_RANGE).map(Command::Steer),
+        "GET" => {
+            let name = tokens.next().ok_or(ParseError::MissingValue)?;
+            if tokens.next().is_some() {
+                return Err(ParseError::InvalidValue);
+            }
+            Ok(Command::Get(name))
+        }
+        "SET" => {
+            let name = tokens.next().ok_or(ParseError::MissingValue)?;
+            let value_str = tokens.next().ok_or(ParseError::MissingValue)?;
+            if tokens.next().is_some() {
+                return Err(ParseError::InvalidValue);
+            }
+            let value: i32 = value_str.parse().map_err(|_| ParseError::InvalidValue)?;
+            Ok(Command::Set(name, value))
+        }
+        "SAVE" => {
+            if tokens.next().is_some() {
+                return Err(ParseError::InvalidValue);
+            }
+            Ok(Command::Save)
+        }
+        _ => Err(ParseError::UnknownCommand),
+    }
+}
+
+/// Shared by `THR`/`STEER`: exactly one float token, range-checked.
+fn parse_float_arg<'a>(
+    mut tokens: impl Iterator<Item = &'a str>,
+    range: core::ops::RangeInclusive<f32>,
+) -> Result<f32, ParseError> {
     let value_str = tokens.next().ok_or(ParseError::MissingValue)?;
     if tokens.next().is_some() {
         return Err(ParseError::InvalidValue);
     }
     let value: f32 = value_str.parse().map_err(|_| ParseError::InvalidValue)?;
-
-    match keyword {
-        "THR" => {
-            if THROTTLE_RANGE.contains(&value) {
-                Ok(Command::Throttle(value))
-            } else {
-                Err(ParseError::OutOfRange)
-            }
-        }
-        "STEER" => {
-            if STEER_RANGE.contains(&value) {
-                Ok(Command::Steer(value))
-            } else {
-                Err(ParseError::OutOfRange)
-            }
-        }
-        _ => Err(ParseError::UnknownCommand),
+    if range.contains(&value) {
+        Ok(value)
+    } else {
+        Err(ParseError::OutOfRange)
     }
 }
 
@@ -174,9 +211,26 @@ pub fn format_error(err: ParseError, buf: &mut [u8]) -> usize {
         ParseError::MissingValue => "missing value",
         ParseError::InvalidValue => "invalid value",
         ParseError::OutOfRange => "out of range",
+        ParseError::UnknownParam => "unknown parameter",
     };
     let mut w = FixedWriter::new(buf);
     match write!(w, "ERR {reason}\r\n") {
+        Ok(()) => w.len,
+        Err(_) => 0,
+    }
+}
+
+/// Formats a `<param>=<value> OK` response line for a successful `GET` or
+/// `SET` - the same `key=value ... OK` shape `format_telemetry`'s `SPD`
+/// line already uses, so the wire format stays consistent across this
+/// protocol's own responses rather than borrowing ESCape32's differently-
+/// shaped `key: value` + separate `OK`/`ERROR` line convention (its
+/// *parameter names* are what's copied here, not its wire format - see
+/// `aart_core::params`). Returns the number of bytes written, or 0 if it
+/// didn't fit.
+pub fn format_param(buf: &mut [u8], name: &str, value: i32) -> usize {
+    let mut w = FixedWriter::new(buf);
+    match write!(w, "{name}={value} OK\r\n") {
         Ok(()) => w.len,
         Err(_) => 0,
     }
@@ -323,5 +377,68 @@ mod tests {
         let mut buf = [0u8; 32];
         let n = format_error(ParseError::OutOfRange, &mut buf);
         assert_eq!(&buf[..n], b"ERR out of range\r\n");
+    }
+
+    #[test]
+    fn get_parses_the_param_name() {
+        assert_eq!(parse_line("GET timing_a"), Ok(Command::Get("timing_a")));
+    }
+
+    #[test]
+    fn get_requires_exactly_one_argument() {
+        assert_eq!(parse_line("GET"), Err(ParseError::MissingValue));
+        assert_eq!(parse_line("GET timing_a extra"), Err(ParseError::InvalidValue));
+    }
+
+    #[test]
+    fn set_parses_the_param_name_and_integer_value() {
+        assert_eq!(parse_line("SET timing_a 15"), Ok(Command::Set("timing_a", 15)));
+        assert_eq!(parse_line("SET revdir_b 1"), Ok(Command::Set("revdir_b", 1)));
+    }
+
+    #[test]
+    fn set_accepts_a_negative_integer() {
+        // Not meaningful for any current parameter, but parsing shouldn't
+        // itself reject it - aart_core::params's range check does that.
+        assert_eq!(parse_line("SET timing_a -1"), Ok(Command::Set("timing_a", -1)));
+    }
+
+    #[test]
+    fn set_rejects_a_non_integer_value() {
+        assert_eq!(parse_line("SET timing_a 1.5"), Err(ParseError::InvalidValue));
+        assert_eq!(parse_line("SET timing_a fast"), Err(ParseError::InvalidValue));
+    }
+
+    #[test]
+    fn set_requires_exactly_two_arguments() {
+        assert_eq!(parse_line("SET timing_a"), Err(ParseError::MissingValue));
+        assert_eq!(parse_line("SET timing_a 1 extra"), Err(ParseError::InvalidValue));
+    }
+
+    #[test]
+    fn save_takes_no_arguments() {
+        assert_eq!(parse_line("SAVE"), Ok(Command::Save));
+        assert_eq!(parse_line("SAVE now"), Err(ParseError::InvalidValue));
+    }
+
+    #[test]
+    fn param_error_formats_a_readable_reason() {
+        let mut buf = [0u8; 32];
+        let n = format_error(ParseError::UnknownParam, &mut buf);
+        assert_eq!(&buf[..n], b"ERR unknown parameter\r\n");
+    }
+
+    #[test]
+    fn format_param_formats_the_documented_shape() {
+        let mut buf = [0u8; 32];
+        let n = format_param(&mut buf, "timing_a", 15);
+        assert_eq!(&buf[..n], b"timing_a=15 OK\r\n");
+    }
+
+    #[test]
+    fn format_param_reports_zero_when_it_does_not_fit() {
+        let mut buf = [0u8; 4];
+        let n = format_param(&mut buf, "timing_a", 15);
+        assert_eq!(n, 0);
     }
 }

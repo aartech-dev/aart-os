@@ -46,15 +46,15 @@ pub fn current_present(sample: u16, zero_offset: u16, min_magnitude: u16) -> boo
 
 #[derive(Debug, Clone, Copy)]
 pub struct DragBrakeConfig {
-    /// Duty (0.0-1.0) applied while the drag brake is engaged - see
-    /// `Bridge::brake`. Not the same knob as any commutation duty; this is
-    /// how hard the winding short is chopped, tunable independently of
-    /// everything else. 0.0 would engage but brake with no effect (pure
-    /// coast); 1.0 is a continuous full short.
-    pub duty: f32,
     /// Consecutive "no current" ticks required before engaging - guards
     /// against a single noisy/glitched reading false-triggering a brake
     /// event mid-run. 1 reacts on the very first bad tick.
+    ///
+    /// Note: the brake *duty* actually applied isn't configured here - it
+    /// lives on `CommutatorConfig::drag_brake_duty` (read by `poll()` while
+    /// `Braking`), since `DragBrakeSupervisor` only ever decides *whether*
+    /// to engage, never *how hard* - keeping this struct free of a field
+    /// it would never itself read.
     pub debounce_ticks: u16,
 }
 
@@ -116,10 +116,7 @@ mod tests {
     use super::*;
 
     fn cfg(debounce_ticks: u16) -> DragBrakeConfig {
-        DragBrakeConfig {
-            duty: 0.6,
-            debounce_ticks,
-        }
+        DragBrakeConfig { debounce_ticks }
     }
 
     #[test]

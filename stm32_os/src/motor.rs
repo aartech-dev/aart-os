@@ -26,12 +26,12 @@ const MMS_UPDATE: u8 = 0b010;
 
 pub const DEADTIME_NANOS: u32 = 500;
 
-// Switching frequency at the low/high ends of the eRPM range (see
-// aart_core::commutator::PwmFrequencySchedule, driven from main.rs).
-// Values as specified for these motors; not yet tuned against the actual
-// clock resolution available - see set_frequency_hz's note on that.
+// Initial PWM switching frequency at construction time, before the first
+// live retune - aart_core::commutator::PwmFrequencySchedule (main.rs) takes
+// over immediately afterward, built from aart_core::params::Params::
+// freq_min/freq_max (GET/SET/SAVE-able, DESIGN.md section 7.7) rather than
+// a fixed max constant, so only MIN survives here as a real constant.
 pub const PWM_FREQUENCY_MIN_KHZ: u32 = 48;
-pub const PWM_FREQUENCY_MAX_KHZ: u32 = 96;
 
 /// Three duty-cycle channels driving one motor's 3-phase bridge, plus what's
 /// needed to retune the PWM switching frequency at runtime (see

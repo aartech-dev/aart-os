@@ -570,6 +570,12 @@ Simple line-based text protocol (bench-friendly):
 > THR 0.35
 > STEER -0.10
 < SPD a=1200rpm b=980rpm slip=0.02 OK
+> GET timing_a
+< timing_a=0 OK
+> SET duty_drag 75
+< duty_drag=75 OK
+> SAVE
+< SAVE=1 OK
 ```
 
 Parsing/formatting is pure logic in `aart-core::protocol`, host-tested for
@@ -581,6 +587,11 @@ boundaries. `stm32_os` does byte I/O against USART1 (PB6/PB7 — see 6.2,
 a real track/motors) but is a deliberate no-op on real hardware — see 7.1,
 there's no throttle input for it to drive. `STEER` is the only command that
 actually changes anything once a motor is Running.
+
+`GET`/`SET`/`SAVE` are the runtime parameter interface — see §7.7 for the
+parameter table, persistence, and why the wire format here (`key=value OK`)
+doesn't literally copy ESCape32's own CLI shape even though the parameter
+*names* do.
 
 ### 7.3 Electronic differential + slip estimate
 
@@ -735,9 +746,9 @@ car, in `main.rs`'s slow 1kHz loop, not the ISR) turns that single
 **`Commutator` gained a fourth `RunPhase`, `Braking`** — entered only via
 an explicit `engage_drag_brake()` call from the code above (never derived
 internally; `Commutator` has no current-sensing input of its own). While
-`Braking`, `poll()` returns a fixed `drag_brake_duty` (a placeholder
-tunable, `DRAG_BRAKE_DUTY` in `main.rs`, independent of `sync_max_duty`/
-the differential controller's output — it's a dead-short chop ratio, not
+`Braking`, `poll()` returns a fixed `drag_brake_duty` (settable at runtime
+as `duty_drag` — see §7.7 — independent of `sync_max_duty`/the
+differential controller's output — it's a dead-short chop ratio, not
 a commutation duty) and ignores `on_zero_cross` entirely, since the
 phases are shorted together, not floating per six-step — there's nothing
 meaningful to detect. `release_drag_brake()` resets every ramp/BEMF field
@@ -840,6 +851,134 @@ axle-bias gain entirely), `FourWheelFrontRear` delegates to
 `front_rear_bias` exactly (confirmed by checking that, unlike
 `TwoWheelLeftRight`, a left and a right turn of equal sharpness bias
 identically through it).
+
+### 7.7 Runtime parameters (`aart-core::params`) + flash persistence
+
+Bench tuning (PWM switching frequencies, sync/spin-up duty and ramp rate,
+drag-brake chop duty, per-motor commutation timing advance and direction)
+was previously only reachable by editing `main.rs` constants and
+reflashing. `GET`/`SET`/`SAVE` (§7.2) make these gettable, settable, and
+persistent across power cycles without a rebuild.
+
+**Parameter names are copied from
+[ESCape32](https://github.com/neoxic/ESCape32)'s own configuration**
+(`src/common.h`'s `Cfg` struct, `src/prog.c`'s `CFG_MAP`) wherever a clear
+equivalent exists, read directly from ESCape32's real source rather than
+guessed:
+
+| Name | Meaning | Range | ESCape32 field | Maps to |
+|---|---|---|---|---|
+| `freq_min` | PWM switching frequency at low eRPM | 20-150 kHz | `freq_min` | `PwmFrequencySchedule::min_khz` |
+| `freq_max` | PWM switching frequency at high eRPM | 20-150 kHz | `freq_max` | `PwmFrequencySchedule::max_khz` |
+| `duty_spup` | Spin-up/startup duty | 1-100 % | `duty_spup` | `CommutatorConfig::sync_start_duty` |
+| `duty_ramp` | Sync ramp rate | 1-10000 eRPM/step | `duty_ramp`* | `CommutatorConfig::sync_ramp_erpm_per_step` |
+| `duty_drag` | Drag-brake ("Latvian brake") chop duty | 0-100 % | `duty_drag` | `CommutatorConfig::drag_brake_duty` |
+| `timing_a` | Motor A commutation timing advance | 0-31 | `timing`** | `CommutatorConfig::timing` |
+| `timing_b` | Motor B commutation timing advance | 0-31 | `timing`** | `CommutatorConfig::timing` |
+| `revdir_a` | Motor A direction reversed | 0/1 | `revdir`** | `CommutatorConfig::reverse` |
+| `revdir_b` | Motor B direction reversed | 0/1 | `revdir`** | `CommutatorConfig::reverse` |
+
+\* Units differ: ESCape32's `duty_ramp` is a kERPM *threshold*, this
+project's is a per-commutation-step eRPM *increment* — the closest analog,
+not an identical quantity, since the two firmwares' sync-ramp algorithms
+aren't the same shape.
+\*\* ESCape32 is single-motor firmware, so `timing`/`revdir` are singular
+there; this project splits each into `_a`/`_b` since the two motors can
+legitimately need different values (opposite wiring orientation, for
+instance). `freq_min`/`freq_max`/`duty_spup`/`duty_ramp`/`duty_drag` stay
+singular/shared — tuning parameters expected to match for a matched motor
+pair, not per-motor wiring quirks.
+
+**Commutation timing advance** (`timing_a`/`timing_b`) is a real algorithm
+change, not just a stored config value: ESCape32's own formula (`main.c`'s
+`IFTIM_OCR`: comment reads `"Motor timing (15/16 deg) [1..31]"`) was ported
+directly rather than re-derived — `Commutator::on_zero_cross` computes the
+post-zero-cross commutation delay as `period * (32 - timing) / 64` instead
+of the module's original fixed `period / 2`. At `timing = 0` this reduces
+to exactly the original behavior (every pre-existing test still passes
+unchanged); higher values commutate progressively earlier, which is the
+standard technique for improving high-speed torque/efficiency on many BLDC
+motors by pre-loading the next phase ahead of where BEMF theoretically
+crosses. This project's range is `0-31` (0 = no advance), not exactly
+ESCape32's `1-31` — a deliberate, explicitly-flagged deviation, not an
+oversight.
+
+**Reverse direction** (`revdir_a`/`revdir_b`) reverses which way
+`STEP_TABLE` is cycled (`advance_step` goes 1→6→5→4→3→2→1 instead of
+1→2→3→4→5→6→1), which is what actually reverses which way the motor spins.
+`ZeroCrossDetector::check` and the internal `expected_rising_edge` helper
+both had to become direction-aware too — "next step" means a different
+physical step depending on direction, so the expected BEMF crossing
+direction for a given step flips along with it. `Commutator::reverse()`
+exposes the current direction so `main.rs`'s ISR can pass the right value
+to `check`.
+
+**Live retuning**: `Commutator::config_mut()` gives direct mutable access
+to the running config, so a `SET` takes effect on the very next `poll()`/
+`on_zero_cross()` — no need to reconstruct the `Commutator` and lose its
+current sync/BEMF state. `main.rs`'s `apply_params` reapplies every
+live-tunable field unconditionally after any successful `SET` (simpler
+than dispatching on which single field changed, and cheap enough given
+this only runs on an operator-triggered command, not every tick).
+`freq_min`/`freq_max` don't need this at all — `pwm_frequency_schedule`
+builds a fresh `PwmFrequencySchedule` from `params` every tick rather than
+caching one, so those two are live by construction.
+
+**Flash persistence** (`stm32_os::config_store`) follows the same overall
+shape as ESCape32's own (`util.c`'s `savecfg`/`checkcfg`): a compiled-in
+default (`Params::defaults()`), a RAM working copy the firmware actually
+runs from, and a single dedicated flash page erased and reprogrammed
+wholesale on `SAVE` — no wear-leveling, no ping-pong pages, matching
+ESCape32's own choice not to bother with either for something saved
+rarely. The reserved page is the *last* 2KB page of the G474RE's real
+512K flash (`0x0807F800`-`0x0807FFFF`) — `memory.x`'s `FLASH` region length
+was shortened from 512K to 510K specifically so the linker can never place
+code/data there, regardless of how large this firmware grows, without
+needing a separate linker-script memory region for it.
+
+One real difference from ESCape32: `Params::from_bytes` checks a magic
+marker (`0x4141_5254`, "AART") before trusting what's read back from flash,
+where ESCape32 relies solely on `checkcfg`'s per-field clamping to survive
+garbage/erased flash. A magic marker is already a stronger check than that
+precedent, so a full checksum on top was judged not worth the extra code
+for what's still just a corruption *sanity check*, not a safety-critical
+integrity guarantee.
+
+**Known hardware caveat, not engineered around**: erasing/programming a
+flash page briefly stalls the CPU's ability to fetch new instructions from
+that same flash bank (RM0440) — since the ADC1_2 ISR's code lives in that
+bank, `SAVE` pauses real-time commutation stepping for the duration (a
+2KB page erase can take on the order of tens of milliseconds). The PWM
+hardware itself keeps running from its own timer registers regardless (not
+CPU-driven), so this doesn't glitch the actual motor drive voltage, but
+BEMF zero-cross sampling/scheduling pauses and resumes once the write
+completes. ESCape32 accepts the identical tradeoff around its own
+`savecfg` (run with `__disable_irq()` held for the whole operation, and
+its `execcmd`'s `save` case gated on `!ertm && !busy` — "not currently
+spinning") — same recommendation applies here: save during setup/bench
+tuning, not mid-run.
+
+Host-tested (`aart-core/src/params.rs`): `get`/`set` round-trip all nine
+fields against their documented defaults and boundaries, out-of-range
+values are *rejected* rather than silently clamped (unlike ESCape32's own
+`checkcfg`, so an operator never wonders whether a `SET` "worked" with a
+different value than requested), `timing_a`/`timing_b` don't cross-wire,
+unknown names are rejected, and `to_bytes`/`from_bytes` round-trip
+correctly and reject erased flash / truncated / bad-magic buffers.
+`aart-core/src/protocol.rs` host-tests the new `GET`/`SET`/`SAVE` line
+syntax and the `format_param`/`UnknownParam`-error wire formatting
+directly.
+
+**Not yet done / open questions**: the documented ranges above (freq_min/
+max's 20-150kHz in particular) are placeholders pending real bench tuning
+against actual 1106 motor/track characteristics, same caveat as every
+other tunable in this project. There's no `SHOW`-style command to list all
+current values in one shot yet (`aart_core::params::PARAM_NAMES` exists as
+the name-list building block for one, just not wired to a command). No
+cross-field validation exists either (e.g. `SET freq_max` below the
+current `freq_min` is accepted, not rejected or clamped) - matches
+ESCape32's original per-field-only `checkcfg` approach for now, but is
+worth revisiting if it proves confusing in practice.
 
 ## 8. Milestones
 
@@ -1068,6 +1207,35 @@ build-time constant and renamed `axle_controller`/`axle_bias` back to
 `diff_controller`/`bias_cmd` (no longer implies front/rear-only).
 
 Verified: 91 `aart-core` host tests pass (81 + 10 new), and `stm32_os`
+builds cleanly (debug + release, real `stm32g474` feature) with no
+warnings.
+
+**Post-bidirectional-detection: runtime parameters + flash persistence.**
+`GET`/`SET`/`SAVE` UART commands (§7.2) for the tunables that were
+previously fixed `main.rs` constants - see §7.7 for the full reasoning.
+Summary: new `aart-core::params` module (`Params`, 9 fields named after
+ESCape32's own config - `freq_min`/`freq_max`/`duty_spup`/`duty_ramp`/
+`duty_drag`/`timing_a`/`timing_b`/`revdir_a`/`revdir_b` - `get`/`set`
+with range validation, `to_bytes`/`from_bytes` with a magic-marker check,
+9 host tests). `protocol.rs`'s `Command` gained a lifetime and
+`Get(&str)`/`Set(&str, i32)`/`Save` variants, plus a `format_param`
+formatter and a `ParseError::UnknownParam` variant (13 new host tests).
+Two real algorithm changes landed in `Commutator`, both ported from
+ESCape32's own field-proven formulas rather than re-derived: commutation
+timing advance (`on_zero_cross`'s delay becomes `period * (32-timing)/64`,
+reducing to the original `period/2` at `timing=0`) and reverse direction
+(`advance_step`/`expected_rising_edge`/`ZeroCrossDetector::check` all
+became direction-aware) - 6 new host tests, plus a `config_mut()`
+accessor so a `SET` takes effect immediately without losing sync state.
+New `stm32_os::config_store` module persists `Params` to the last 2KB
+flash page (`memory.x`'s `FLASH` length shortened 512K→510K to reserve
+it), same erase-and-reprogram-wholesale shape as ESCape32's own
+`savecfg` - including accepting the same real cost (a page erase briefly
+stalls the ADC1_2 ISR, since flash can't be fetched from while it's being
+written). Also removed `DragBrakeConfig::duty` (confirmed dead - never
+read by `DragBrakeSupervisor` itself; the real duty lives on
+`CommutatorConfig::drag_brake_duty`, now `params.duty_drag`-driven).
+Verified: 119 `aart-core` host tests pass (91 + 28 new), and `stm32_os`
 builds cleanly (debug + release, real `stm32g474` feature) with no
 warnings.
 
