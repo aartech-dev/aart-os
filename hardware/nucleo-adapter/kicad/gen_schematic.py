@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
-"""Generates adapter.kicad_sch from a data-driven component/net list.
+"""Generates the adapter's hierarchical KiCad project: main.kicad_sch (root -
+draws the Nucleo-G474RE as a block, plus three sub-sheet blocks, wired
+together with real point-to-point wires between named pins) and three child
+sheets (power.kicad_sch, motor_a.kicad_sch, motor_b.kicad_sch) holding the
+actual circuits.
 
-Hand-authoring ~100 near-identical KiCad symbol-placement blocks directly
-is repetitive and error-prone; this script computes exact pin coordinates
-(component position + library pin offset, rotated) and emits both the
-symbol placement and a matching global_label at each net connection, so
-connectivity is correct by construction rather than by manual coordinate
-arithmetic. Run, then validate with `kicad-cli sch erc adapter.kicad_sch`.
+Hand-authoring this many near-identical KiCad symbol/sheet-placement blocks
+directly is repetitive and error-prone; this script computes exact pin
+coordinates (component position + library pin offset, rotated) and emits
+both the symbol placement and a matching label at each net connection, so
+connectivity is correct by construction. Run, then validate with
+`kicad-cli sch erc main.kicad_sch`.
 """
 import math
+import os
 import uuid
+
 
 def u():
     return str(uuid.uuid4())
 
+
 def rot(x, y, deg):
     r = math.radians(deg)
     return (x * math.cos(r) - y * math.sin(r), x * math.sin(r) + y * math.cos(r))
+
+
+# Fixed so re-running the generator doesn't change sheet identity/paths.
+ROOT_UUID = "10000000-0000-0000-0000-000000000001"
+POWER_UUID = "10000000-0000-0000-0000-000000000002"
+MOTORA_UUID = "10000000-0000-0000-0000-000000000003"
+MOTORB_UUID = "10000000-0000-0000-0000-000000000004"
 
 # ---------------------------------------------------------------------------
 # Pin geometry tables: lib_id -> {pin_number: (dx, dy, pin_rotation_deg)}
@@ -92,26 +106,43 @@ UNIT_OF_PIN = {
     "Amplifier_Operational:LM2904": {"1": 1, "2": 1, "3": 1, "4": 3, "5": 2, "6": 2, "7": 2, "8": 3},
 }
 
-sch_symbols = []   # placement sexp text
-sch_labels = []    # global_label sexp text
-sch_wires = []     # short pin->label stub wires (see place(), STUB_LEN)
-sch_no_connects = []  # explicit no_connect markers for genuinely-unused pins
+# ---------------------------------------------------------------------------
+# Multi-sheet plumbing: every place()/label()/wire() call operates on
+# whichever Sheet is CURRENT at the time, so the same building code can
+# target different output files just by swapping CURRENT before running it.
+# Reference designators are a single global counter (not per-sheet) so they
+# stay unique project-wide, matching standard KiCad hierarchical practice.
+# ---------------------------------------------------------------------------
 ref_counters = {}
-pwr_counter = [0]
+PAGE_COUNTER = [2]  # page "1" is main; children get 2,3,4...
 
-# Extra length (mm) each pin grows by via a short stub wire before a label
-# lands on it. Densely-pinned parts (AP3012, DRV8300D, CSD16327Q3, etc.)
-# have several pins within a few mm of each other on the symbol body itself;
-# placing a global_label directly on the raw pin tip crowds its text into
-# neighboring pins/labels. Extending every pin outward (away from the
-# symbol's own center, same direction the pin already points) by a fixed
-# stub before the label lands there gives the label room without changing
-# connectivity - the wire segment is zero-impedance, same net either way.
+
+class Sheet:
+    def __init__(self, tag, path_prefix):
+        self.tag = tag
+        self.path_prefix = path_prefix
+        self.symbols = []
+        self.wires = []
+        self.labels = []
+        self.no_connects = []
+        self.hier_labels = []
+        self.sheet_blocks = []
+        self.used_lib_ids = set()
+
+
+CURRENT = None
+
+
+def next_ref(prefix):
+    ref_counters[prefix] = ref_counters.get(prefix, 0) + 1
+    return f"{prefix}{ref_counters[prefix]}"
+
+
 STUB_LEN = 6.0
 
 
 def wire(x1, y1, x2, y2):
-    sch_wires.append(
+    CURRENT.wires.append(
         "\n".join([
             "\t(wire",
             f"\t\t(pts (xy {x1:.2f} {y1:.2f}) (xy {x2:.2f} {y2:.2f}))",
@@ -122,15 +153,15 @@ def wire(x1, y1, x2, y2):
     )
 
 
-def next_ref(prefix):
-    ref_counters[prefix] = ref_counters.get(prefix, 0) + 1
-    return f"{prefix}{ref_counters[prefix]}"
+def wire_pts(p1, p2):
+    wire(p1[0], p1[1], p2[0], p2[1])
 
 
-def place(lib_id, x, y, rotation=0, ref=None, ref_prefix="U", value=None, footprint_override=None, unit=1, no_connect=()):
-    """Places one symbol instance; returns {pin_number: (abs_x, abs_y)}."""
+def place(lib_id, x, y, rotation=0, ref=None, ref_prefix="U", value=None, footprint_override=None, unit=1, no_connect=(), stub=True):
+    """Places one symbol instance in CURRENT sheet; returns {pin_number: (abs_x, abs_y)}."""
     if ref is None:
         ref = next_ref(ref_prefix)
+    CURRENT.used_lib_ids.add(lib_id)
     sym_uuid = u()
     props = []
     props.append(f'\t\t(property "Reference" "{ref}" (at {x+6:.2f} {y-3:.2f} 0) (effects (font (size 1.27 1.27))))')
@@ -165,9 +196,9 @@ def place(lib_id, x, y, rotation=0, ref=None, ref_prefix="U", value=None, footpr
     ]
     text += props
     text += pin_lines
-    text.append(f'\t\t(instances (project "adapter" (path "/" (reference "{ref}") (unit {unit}))))')
+    text.append(f'\t\t(instances (project "adapter" (path "{CURRENT.path_prefix}" (reference "{ref}") (unit {unit}))))')
     text.append("\t)")
-    sch_symbols.append("\n".join(text))
+    CURRENT.symbols.append("\n".join(text))
 
     for num, (dx, dy, _prot) in pins.items():
         # Skip pins belonging to a *different* unit than the one actually
@@ -193,9 +224,10 @@ def place(lib_id, x, y, rotation=0, ref=None, ref_prefix="U", value=None, footpr
             # Genuinely-unused pin (e.g. an IC's NC pin) - a proper
             # no_connect marker at the raw pin tip, not a stub wire to
             # nowhere (which ERC correctly flags as wire_dangling).
-            sch_no_connects.append(
-                f'\t(no_connect (at {px:.2f} {py:.2f}) (uuid "{u()}"))'
-            )
+            CURRENT.no_connects.append(f'\t(no_connect (at {px:.2f} {py:.2f}) (uuid "{u()}"))')
+            abs_coords[num] = (px, py)
+            continue
+        if not stub:
             abs_coords[num] = (px, py)
             continue
         mag = math.hypot(ox, oy)
@@ -209,10 +241,26 @@ def place(lib_id, x, y, rotation=0, ref=None, ref_prefix="U", value=None, footpr
     return ref, abs_coords
 
 
-def label(net, x, y, shape="passive"):
-    sch_labels.append(
+def label(net, x, y):
+    """Sheet-LOCAL label (not global) - only connects within CURRENT sheet.
+    Cross-sheet connectivity is done explicitly via hier_label()/sheet pins,
+    not by same-named labels leaking across files - the whole point of
+    partitioning is that each sheet's internal nets are actually private."""
+    CURRENT.labels.append(
         "\n".join([
-            f'\t(global_label "{net}"',
+            f'\t(label "{net}"',
+            f"\t\t(at {x:.2f} {y:.2f} 0)",
+            "\t\t(effects (font (size 1.27 1.27)))",
+            f'\t\t(uuid "{u()}")',
+            "\t)",
+        ])
+    )
+
+
+def hier_label(net, x, y, shape):
+    CURRENT.hier_labels.append(
+        "\n".join([
+            f'\t(hierarchical_label "{net}"',
             f"\t\t(shape {shape})",
             f"\t\t(at {x:.2f} {y:.2f} 0)",
             "\t\t(effects (font (size 1.27 1.27)))",
@@ -233,193 +281,243 @@ def pwr_flag(x, y):
 
 
 def net(name, *points):
-    """Connects every (x,y) point to the same net via matching labels."""
+    """Connects every (x,y) point to the same sheet-local net via matching labels."""
     for (x, y) in points:
-        label(name, x, y)
+        label(name, *point_xy(x, y))
+
+
+def point_xy(x, y):
+    return (x, y)
+
+
+def place_sheet(name, filename, x, y, w, h, pins, sheet_uuid):
+    """Places a sheet-symbol block (with named pins) in CURRENT (root) sheet.
+    pins: list of (net_name, kicad_shape, abs_y) - all on the sheet's LEFT
+    edge (x). Returns {net_name: (abs_x, abs_y)}."""
+    lines = [
+        "\t(sheet",
+        f"\t\t(at {x:.2f} {y:.2f})",
+        f"\t\t(size {w:.2f} {h:.2f})",
+        "\t\t(exclude_from_sim no)",
+        "\t\t(in_bom yes)",
+        "\t\t(on_board yes)",
+        "\t\t(dnp no)",
+        "\t\t(fields_autoplaced yes)",
+        "\t\t(stroke (width 0.1524) (type solid))",
+        "\t\t(fill (color 0 0 0 0))",
+        f'\t\t(uuid "{sheet_uuid}")',
+        f'\t\t(property "Sheetname" "{name}" (at {x:.2f} {y-3:.2f} 0) (effects (font (size 1.27 1.27)) (justify left bottom)))',
+        f'\t\t(property "Sheetfile" "{filename}" (at {x:.2f} {y+h+3:.2f} 0) (effects (font (size 1.27 1.27)) (justify left top)))',
+    ]
+    abs_coords = {}
+    for net_name, shape, py in pins:
+        lines.append(f'\t\t(pin "{net_name}" {shape} (at {x:.2f} {py:.2f} 180) (effects (font (size 1.27 1.27))))')
+        abs_coords[net_name] = (x, py)
+    lines.append(f'\t\t(instances (project "adapter" (path "/{ROOT_UUID}" (page "{PAGE_COUNTER[0]}"))))')
+    PAGE_COUNTER[0] += 1
+    lines.append("\t)")
+    CURRENT.sheet_blocks.append("\n".join(lines))
+    return abs_coords
 
 
 # ---------------------------------------------------------------------------
-# SHARED: track power in, reverse-polarity protection, boost, LDO,
-# bidirectional track-current sense (DESIGN.md section 6.5/6.4/7.5/7.7).
+# POWER sheet: track power in, reverse-polarity protection, boost, LDO,
+# shared bidirectional track-current sense (DESIGN.md section 6.5/6.4/7.5/7.7).
+# Boundary nets (exposed via hier_label + a matching sheet pin on main):
+# PA2, PB12 (sense outputs to the Nucleo), VDD, GND (shared with Nucleo and
+# both motor sheets), VCC, VBUS_LOAD (feed both motor sheets only).
 # ---------------------------------------------------------------------------
 
-# --- Track power input + reverse-polarity protection ---
-# Single N-FET "ideal diode", low-side placement: Q1 drain = TRACK_RTN (the
-# externally-wired "return" terminal - may actually be positive if the
-# installer swapped the two wires), Q1 source = GND (system ground everything
-# else references). Body diode conducts (helps current flow) only when
-# correctly wired; gate biased toward TRACK_PWR through R1, clamped by zener
-# D1, so Vgs collapses toward 0 (FET stays off) if the wires are swapped.
-# Deliberately simpler than RemoraNSR3.0's own undocumented multi-transistor
-# reverse-protection network (DESIGN.md 6.5 already flags that circuit as
-# never fully reverse-engineered) - this is a standard, well-understood
-# textbook topology instead, chosen for correctness confidence over blind
-# replication.
-_, j1 = place("Connector_Generic:Conn_01x01", 20, 160, ref_prefix="J", value="Track +")
-_, j2 = place("Connector_Generic:Conn_01x01", 20, 120, ref_prefix="J", value="Track -")
-net("TRACK_PWR", j1["1"])
-net("TRACK_RTN_RAW", j2["1"])
-pwr_flag(20, 175)
-net("TRACK_PWR", (20, 175))
+def build_power():
+    global CURRENT
+    CURRENT = Sheet("power", f"/{ROOT_UUID}/{POWER_UUID}")
 
-_, q1 = place("AdapterSymbols:CSD16327Q3", 65, 120, ref_prefix="Q", value="CSD16327Q3")
-net("TRACK_RTN_RAW", q1["5"])  # D
-net("GND", q1["1"])            # S (x3 pins, same coordinate)
-net("RP_GATE", q1["4"])        # G
+    # --- Track power input + reverse-polarity protection ---
+    # Single N-FET "ideal diode", low-side placement: Q1 drain = TRACK_RTN (the
+    # externally-wired "return" terminal - may actually be positive if the
+    # installer swapped the two wires), Q1 source = GND (system ground everything
+    # else references). Body diode conducts (helps current flow) only when
+    # correctly wired; gate biased toward TRACK_PWR through R1, clamped by zener
+    # D1, so Vgs collapses toward 0 (FET stays off) if the wires are swapped.
+    # Deliberately simpler than RemoraNSR3.0's own undocumented multi-transistor
+    # reverse-protection network (DESIGN.md 6.5 already flags that circuit as
+    # never fully reverse-engineered) - this is a standard, well-understood
+    # textbook topology instead, chosen for correctness confidence over blind
+    # replication.
+    _, j1 = place("Connector_Generic:Conn_01x01", 20, 160, ref_prefix="J", value="Track +")
+    _, j2 = place("Connector_Generic:Conn_01x01", 20, 120, ref_prefix="J", value="Track -")
+    net("TRACK_PWR", j1["1"])
+    net("TRACK_RTN_RAW", j2["1"])
+    pwr_flag(20, 175)
+    net("TRACK_PWR", (20, 175))
 
-_, r1 = place("Device:R", 65, 155, rotation=90, ref_prefix="R", value="10k")
-net("TRACK_PWR", r1["1"])
-net("RP_GATE", r1["2"])
+    _, q1 = place("AdapterSymbols:CSD16327Q3", 65, 120, ref_prefix="Q", value="CSD16327Q3")
+    net("TRACK_RTN_RAW", q1["5"])  # D
+    net("GND", q1["1"])            # S (x3 pins, same coordinate)
+    net("RP_GATE", q1["4"])        # G
 
-_, d1 = place("AdapterSymbols:D_Zener_Small", 95, 135, ref_prefix="D", value="15V")
-net("RP_GATE", d1["1"])  # K
-net("GND", d1["2"])      # A
+    _, r1 = place("Device:R", 65, 155, rotation=90, ref_prefix="R", value="10k")
+    net("TRACK_PWR", r1["1"])
+    net("RP_GATE", r1["2"])
 
-net("TRACK_PWR", (20, 160))  # VBUS = TRACK_PWR directly (unprotected side - see module doc)
-label("VBUS", 20, 160)
+    _, d1 = place("AdapterSymbols:D_Zener_Small", 95, 135, ref_prefix="D", value="15V")
+    net("RP_GATE", d1["1"])  # K
+    net("GND", d1["2"])      # A
 
-# --- Boost regulator: VBUS -> VCC (boosted gate-drive supply), ~12V target ---
-# AP3012 adjustable boost. R2/R3 set the FB divider - placeholder values
-# targeting ~12V assuming a ~1.25V FB reference; verify against the AP3012
-# datasheet's actual reference voltage before board bring-up. L1/D2/C1/C2
-# values are likewise placeholders pending real characterization.
-_, u1 = place("AdapterSymbols:AP3012", 140, 150, ref_prefix="U", value="AP3012")
-net("VBUS", u1["5"])   # IN
-net("VBUS", u1["4"])   # ~SHDN tied to IN - always enabled (matches RemoraNSR3.0's own wiring)
-net("GND", u1["2"])    # GND
-gnd_pt = gnd(140, 175)  # real power:GND symbol - for schematic readability
-net("GND", gnd_pt)
-_gnd_flag = pwr_flag(140, 190)  # power:GND's own pin is power_in, not power_out - still needs a PWR_FLAG
-net("GND", (140, 190))
+    net("TRACK_PWR", (20, 160))  # VBUS = TRACK_PWR directly (unprotected side - see module doc)
+    label("VBUS", 20, 160)
 
-_, l1 = place("Device:L", 110, 165, rotation=90, ref_prefix="L", value="10uH")
-net("VBUS", l1["1"])
-net("AP3012_SW", l1["2"])
-net("AP3012_SW", u1["1"])  # SW
+    # --- Boost regulator: VBUS -> VCC (boosted gate-drive supply), ~12V target ---
+    # AP3012 adjustable boost. R2/R3 set the FB divider - placeholder values
+    # targeting ~12V assuming a ~1.25V FB reference; verify against the AP3012
+    # datasheet's actual reference voltage before board bring-up. L1/D2/C1/C2
+    # values are likewise placeholders pending real characterization.
+    _, u1 = place("AdapterSymbols:AP3012", 140, 150, ref_prefix="U", value="AP3012")
+    net("VBUS", u1["5"])   # IN
+    net("VBUS", u1["4"])   # ~SHDN tied to IN - always enabled (matches RemoraNSR3.0's own wiring)
+    net("GND", u1["2"])    # GND
+    gnd_pt = gnd(140, 175)  # real power:GND symbol - for schematic readability
+    net("GND", gnd_pt)
+    _gnd_flag = pwr_flag(140, 190)  # power:GND's own pin is power_in, not power_out - still needs a PWR_FLAG
+    net("GND", (140, 190))
 
-_, d2 = place("Device:D", 165, 165, ref_prefix="D", value="Schottky (e.g. SS14)")
-# Device:D pin "1" = K (cathode), pin "2" = A (anode) - a boost rectifier
-# conducts switch-node -> VCC, i.e. anode at the switch node, cathode at VCC.
-net("AP3012_SW", d2["2"])  # A
-net("VCC", d2["1"])        # K
+    _, l1 = place("Device:L", 110, 165, rotation=90, ref_prefix="L", value="10uH")
+    net("VBUS", l1["1"])
+    net("AP3012_SW", l1["2"])
+    net("AP3012_SW", u1["1"])  # SW
 
-_, c1 = place("Device:C", 140, 115, rotation=90, ref_prefix="C", value="10uF")
-net("VBUS", c1["1"])
-net("GND", c1["2"])
+    _, d2 = place("Device:D", 165, 165, ref_prefix="D", value="Schottky (e.g. SS14)")
+    # Device:D pin "1" = K (cathode), pin "2" = A (anode) - a boost rectifier
+    # conducts switch-node -> VCC, i.e. anode at the switch node, cathode at VCC.
+    net("AP3012_SW", d2["2"])  # A
+    net("VCC", d2["1"])        # K
 
-_, c2 = place("Device:C", 190, 150, rotation=90, ref_prefix="C", value="22uF")
-net("VCC", c2["1"])
-net("GND", c2["2"])
+    _, c1 = place("Device:C", 140, 115, rotation=90, ref_prefix="C", value="10uF")
+    net("VBUS", c1["1"])
+    net("GND", c1["2"])
 
-_, r2 = place("Device:R", 210, 165, rotation=90, ref_prefix="R", value="86k")
-net("VCC", r2["1"])
-net("AP3012_FB", r2["2"])
-net("AP3012_FB", u1["3"])  # FB
+    _, c2 = place("Device:C", 190, 150, rotation=90, ref_prefix="C", value="22uF")
+    net("VCC", c2["1"])
+    net("GND", c2["2"])
 
-_, r3 = place("Device:R", 210, 130, rotation=90, ref_prefix="R", value="10k")
-net("AP3012_FB", r3["1"])
-net("GND", r3["2"])
+    _, r2 = place("Device:R", 210, 165, rotation=90, ref_prefix="R", value="86k")
+    net("VCC", r2["1"])
+    net("AP3012_FB", r2["2"])
+    net("AP3012_FB", u1["3"])  # FB
 
-# VCC bus-tap label deliberately omitted here - it'll be added by task #20
-# wiring directly to each DRV8300D's GVDD pin, once those are placed.
-_vcc_flag = pwr_flag(140, 100)  # boost output isn't power_out-typed per ERC (SW/diode pins are passive)
-net("VCC", (140, 100))
+    _, r3 = place("Device:R", 210, 130, rotation=90, ref_prefix="R", value="10k")
+    net("AP3012_FB", r3["1"])
+    net("GND", r3["2"])
 
-# --- Logic LDO: VCC -> VDD (3.3V, matches the Nucleo's own logic rail) ---
-_, u2 = place("AdapterSymbols:AP2204K-3.3", 240, 150, ref_prefix="U", value="AP2204K-3.3", no_connect={"4"})
-net("VCC", u2["1"])   # VIN
-net("VCC", u2["3"])   # EN tied on
-net("GND", u2["2"])   # GND
-net("VDD", u2["5"])   # VOUT
+    _vcc_flag = pwr_flag(140, 100)  # boost output isn't power_out-typed per ERC (SW/diode pins are passive)
+    net("VCC", (140, 100))
+    hier_label("VCC", 140, 95, "output")
+    net("VCC", (140, 95))
 
-_, c3 = place("Device:C", 220, 115, rotation=90, ref_prefix="C", value="1uF")
-net("VCC", c3["1"])
-net("GND", c3["2"])
+    # --- Logic LDO: VCC -> VDD (3.3V, matches the Nucleo's own logic rail) ---
+    _, u2 = place("AdapterSymbols:AP2204K-3.3", 240, 150, ref_prefix="U", value="AP2204K-3.3", no_connect={"4"})
+    net("VCC", u2["1"])   # VIN
+    net("VCC", u2["3"])   # EN tied on
+    net("GND", u2["2"])   # GND
+    net("VDD", u2["5"])   # VOUT
 
-_, c4 = place("Device:C", 260, 115, rotation=90, ref_prefix="C", value="1uF")
-net("VDD", c4["1"])
-net("GND", c4["2"])
+    _, c3 = place("Device:C", 220, 115, rotation=90, ref_prefix="C", value="1uF")
+    net("VCC", c3["1"])
+    net("GND", c3["2"])
 
-# VDD bus-tap label deliberately omitted here - it'll be added by task #20 /
-# a later revision wiring directly to the Nucleo 3V3 pin. VDD already has a
-# real power_out driver (U2 VOUT below), so no PWR_FLAG needed for it.
+    _, c4 = place("Device:C", 260, 115, rotation=90, ref_prefix="C", value="1uF")
+    net("VDD", c4["1"])
+    net("GND", c4["2"])
 
-# --- Bidirectional shared track-current sense (DESIGN.md 6.5/7.5) ---
-# Shunt in the VBUS path; MCP6002 unit A buffers a VDD/2 reference, unit B
-# is a 4-resistor difference amp centered on it - chosen over betting on an
-# unfamiliar bidirectional current-sense IC (see commit notes). Output net
-# PA2 matches the real GPIO this feeds (DESIGN.md 6.1/6.5).
-_, r_shunt = place("Device:R", 65, 90, rotation=90, ref_prefix="R", value="5mOhm 1W")
-net("VBUS", r_shunt["1"])
-# VBUS_LOAD (not VBUS) is what both bridges' high-side drains actually
-# connect to (see motor_block below) - the shunt must sit in series
-# between the raw input and the bridges for the sense amp to see real
-# load current, per DESIGN.md 6.5 ("shunt on the main input path ...
-# before it splits to the two bridges"). A stray duplicate net name here
-# previously left the bridges tied to raw VBUS, bypassing the shunt
-# entirely - fixed alongside this layout pass since it was found while
-# untangling an overlapping label at this exact point.
-net("VBUS_LOAD", r_shunt["2"])
+    hier_label("VDD", 240, 95, "passive")
+    net("VDD", (240, 95))
 
-_, r4 = place("Device:R", 310, 165, rotation=90, ref_prefix="R", value="10k")
-net("VDD", r4["1"])
-net("VDD_HALF_RAW", r4["2"])
-_, r5 = place("Device:R", 310, 130, rotation=90, ref_prefix="R", value="10k")
-net("VDD_HALF_RAW", r5["1"])
-net("GND", r5["2"])
+    # --- Bidirectional shared track-current sense (DESIGN.md 6.5/7.5) ---
+    # Shunt in the VBUS path; MCP6002 unit A buffers a VDD/2 reference, unit B
+    # is a 4-resistor difference amp centered on it - chosen over betting on an
+    # unfamiliar bidirectional current-sense IC (see commit notes). Output net
+    # PA2 matches the real GPIO this feeds (DESIGN.md 6.1/6.5).
+    _, r_shunt = place("Device:R", 65, 90, rotation=90, ref_prefix="R", value="5mOhm 1W")
+    net("VBUS", r_shunt["1"])
+    # VBUS_LOAD (not VBUS) is what both bridges' high-side drains actually
+    # connect to (see motor sheets) - the shunt must sit in series between
+    # the raw input and the bridges for the sense amp to see real load
+    # current, per DESIGN.md 6.5 ("shunt on the main input path ... before
+    # it splits to the two bridges").
+    net("VBUS_LOAD", r_shunt["2"])
+    hier_label("VBUS_LOAD", 65, 85, "output")
+    net("VBUS_LOAD", (65, 85))
 
-u3_ref, u3 = place("Amplifier_Operational:LM2904", 345, 150, ref_prefix="U", value="MCP6002-xSN", unit=1)
-net("VDD_HALF_RAW", u3["3"])   # unit A: IN1+ = raw divider midpoint
-net("VDD_HALF", u3["2"])       # unit A: IN1- fed back from OUT1 (voltage follower)
-net("VDD_HALF", u3["1"])       # unit A: OUT1 = buffered VDD/2 reference
+    _, r4 = place("Device:R", 310, 165, rotation=90, ref_prefix="R", value="10k")
+    net("VDD", r4["1"])
+    net("VDD_HALF_RAW", r4["2"])
+    _, r5 = place("Device:R", 310, 130, rotation=90, ref_prefix="R", value="10k")
+    net("VDD_HALF_RAW", r5["1"])
+    net("GND", r5["2"])
 
-_, u3pwr = place("Amplifier_Operational:LM2904", 345, 150, ref=u3_ref, unit=3)  # shared power pins
-net("GND", u3pwr["4"])  # V-
-net("VDD", u3pwr["8"])  # V+
+    u3_ref, u3 = place("Amplifier_Operational:LM2904", 345, 150, ref_prefix="U", value="MCP6002-xSN", unit=1)
+    net("VDD_HALF_RAW", u3["3"])   # unit A: IN1+ = raw divider midpoint
+    net("VDD_HALF", u3["2"])       # unit A: IN1- fed back from OUT1 (voltage follower)
+    net("VDD_HALF", u3["1"])       # unit A: OUT1 = buffered VDD/2 reference
 
-_, u3b = place("Amplifier_Operational:LM2904", 400, 150, ref=u3_ref, value=None, unit=2)
-_, r6 = place("Device:R", 380, 165, rotation=90, ref_prefix="R", value="1k")
-net("VBUS", r6["1"])
-net("DIFF_IN_PLUS", r6["2"])
-net("DIFF_IN_PLUS", u3b["5"])  # unit B: IN2+
+    _, u3pwr = place("Amplifier_Operational:LM2904", 345, 150, ref=u3_ref, unit=3)  # shared power pins
+    net("GND", u3pwr["4"])  # V-
+    net("VDD", u3pwr["8"])  # V+
 
-_, r7 = place("Device:R", 380, 130, rotation=90, ref_prefix="R", value="1k")
-net("VBUS_LOAD", r7["1"])
-net("DIFF_IN_MINUS", r7["2"])
-net("DIFF_IN_MINUS", u3b["6"])  # unit B: IN2-
+    _, u3b = place("Amplifier_Operational:LM2904", 400, 150, ref=u3_ref, value=None, unit=2)
+    _, r6 = place("Device:R", 380, 165, rotation=90, ref_prefix="R", value="1k")
+    net("VBUS", r6["1"])
+    net("DIFF_IN_PLUS", r6["2"])
+    net("DIFF_IN_PLUS", u3b["5"])  # unit B: IN2+
 
-_, r8 = place("Device:R", 425, 165, rotation=90, ref_prefix="R", value="20k")
-net("DIFF_IN_PLUS", r8["1"])
-net("VDD_HALF", r8["2"])
+    _, r7 = place("Device:R", 380, 130, rotation=90, ref_prefix="R", value="1k")
+    net("VBUS_LOAD", r7["1"])
+    net("DIFF_IN_MINUS", r7["2"])
+    net("DIFF_IN_MINUS", u3b["6"])  # unit B: IN2-
 
-_, r9 = place("Device:R", 425, 130, rotation=90, ref_prefix="R", value="20k")
-net("DIFF_IN_MINUS", r9["1"])
-net("PA2", r9["2"])
-net("PA2", u3b["7"])  # unit B: OUT2 = ADC1 channel 3, shared track-current sense
+    _, r8 = place("Device:R", 425, 165, rotation=90, ref_prefix="R", value="20k")
+    net("DIFF_IN_PLUS", r8["1"])
+    net("VDD_HALF", r8["2"])
 
-# --- Shared bus-voltage sense (DESIGN.md 6.1: PB12, "one reading is
-# enough" - not per-motor, just a plain divider off VBUS) ---
-_, rv1 = place("Device:R", 65, 60, rotation=90, ref_prefix="R", value="47k")
-net("VBUS", rv1["1"])
-net("PB12", rv1["2"])
-_, rv2 = place("Device:R", 65, 40, rotation=90, ref_prefix="R", value="10k")
-net("PB12", rv2["1"])
-net("GND", rv2["2"])
+    _, r9 = place("Device:R", 425, 130, rotation=90, ref_prefix="R", value="20k")
+    net("DIFF_IN_MINUS", r9["1"])
+    net("PA2", r9["2"])
+    net("PA2", u3b["7"])  # unit B: OUT2 = ADC1 channel 3, shared track-current sense
+    hier_label("PA2", 445, 130, "output")
+    net("PA2", (445, 130))
+
+    # --- Shared bus-voltage sense (DESIGN.md 6.1: PB12, "one reading is
+    # enough" - not per-motor, just a plain divider off VBUS) ---
+    _, rv1 = place("Device:R", 65, 60, rotation=90, ref_prefix="R", value="47k")
+    net("VBUS", rv1["1"])
+    net("PB12", rv1["2"])
+    _, rv2 = place("Device:R", 65, 40, rotation=90, ref_prefix="R", value="10k")
+    net("PB12", rv2["1"])
+    net("GND", rv2["2"])
+    hier_label("PB12", 80, 60, "output")
+    net("PB12", (80, 60))
+
+    hier_label("GND", 20, 105, "passive")
+    net("GND", (20, 105))
+
+    return CURRENT
 
 
 # ---------------------------------------------------------------------------
-# PER-MOTOR: DRV8300D driver + 6x CSD16327Q3 bridge + bootstrap caps +
+# MOTOR sheet: DRV8300D driver + 6x CSD16327Q3 bridge + bootstrap caps +
 # per-phase BEMF dividers + virtual-neutral summing network + per-motor
 # unidirectional current-sense amp (DESIGN.md 6.5's "what scales with motor
-# count" block, x2 for front/rear). GPIO net names are passed in directly
-# from DESIGN.md 6.4's pin table (§6.1 superseded for BEMF_C/neutral/current
-# by the G474 retarget) - connectivity to those nets is by matching
-# global_label name only, so exact physical layout here doesn't need to
-# mirror the Nucleo's own pin geography.
+# count" block, x2 for front/rear). GPIO net names match DESIGN.md 6.4's pin
+# table (superseded for BEMF_C/neutral/current by the G474 retarget) and are
+# exposed as hierarchical labels so the Nucleo block on main.kicad_sch can
+# be wired to them directly by name.
 # ---------------------------------------------------------------------------
 
-def motor_block(suffix, ox, oy, hin, lin, bemf, neutral_net, curr_net):
-    """hin/lin/bemf are each a 3-tuple of net names for phases U,V,W."""
+def build_motor(suffix, sheet_uuid, hin, lin, bemf, neutral_net, curr_net):
+    global CURRENT
+    CURRENT = Sheet(f"motor_{suffix.lower()}", f"/{ROOT_UUID}/{sheet_uuid}")
+    ox, oy = 320, 140
+
     _, drv = place("AdapterSymbols:DRV8300D", ox, oy, ref_prefix="U", value=f"DRV8300D ({suffix})", no_connect={"7", "8"})
     net("VCC", drv["4"])   # GVDD - boosted gate supply, shared
     net("GND", drv["6"])   # GND
@@ -431,18 +529,26 @@ def motor_block(suffix, ox, oy, hin, lin, bemf, neutral_net, curr_net):
     net(lin[1], drv["2"])   # LIN2
     net(lin[2], drv["3"])   # LIN3
 
-    # Physical Nucleo header interface: one connector pin per HIN/LIN
-    # signal, so the schematic honestly represents where these 6 gate-drive
-    # inputs actually enter this board. kicad-cli ERC will still flag all 6
-    # as "Input pin not driven by any Output pins" - that's an expected,
-    # accepted finding, not a defect: the real driver (the STM32G474's TIM1/
-    # TIM8 complementary PWM outputs) is on the Nucleo dev board, a separate
-    # physical board this single-sheet schematic doesn't model. See the
-    # commit notes / README for this documented exclusion.
-    for idx, (name, net_name) in enumerate(zip(("HIN1", "HIN2", "HIN3", "LIN1", "LIN2", "LIN3"), hin + lin)):
-        _, jn = place("Connector_Generic:Conn_01x01", ox - 110, oy + 40 - 15 * idx,
-                      ref_prefix="J", value=f"Nucleo {net_name} ({name}, motor {suffix})")
-        net(net_name, jn["1"])
+    # Boundary pins - one hierarchical label per GPIO/power net crossing to
+    # the Nucleo block or the Power sheet (wired up on main.kicad_sch).
+    # Placed well below the hin/lin loops' range (oy+40 down to oy-35) so
+    # these don't land on the exact same coordinate as one of those labels
+    # (confirmed as a real bug: two differently-named hierarchical labels
+    # sharing one point don't merge sensibly - kicad can't resolve a net
+    # name for the collision and both ends up dumped in an anonymous
+    # unconnected net, which then trips "same-type pins connected").
+    hier_label("VCC", ox - 90, oy - 70, "input")
+    net("VCC", (ox - 90, oy - 70))
+    hier_label("GND", ox - 90, oy - 85, "passive")
+    net("GND", (ox - 90, oy - 85))
+    hier_label("VBUS_LOAD", ox - 90, oy - 100, "input")
+    net("VBUS_LOAD", (ox - 90, oy - 100))
+    for i, net_name in enumerate(hin):
+        hier_label(net_name, ox - 90, oy + 40 - 15 * i, "input")
+        net(net_name, (ox - 90, oy + 40 - 15 * i))
+    for i, net_name in enumerate(lin):
+        hier_label(net_name, ox - 90, oy - 5 - 15 * i, "input")
+        net(net_name, (ox - 90, oy - 5 - 15 * i))
 
     # MODE/DT external bias resistors - pulled low (10k to GND) as a
     # placeholder; DESIGN.md flags this needs datasheet verification before
@@ -457,7 +563,7 @@ def motor_block(suffix, ox, oy, hin, lin, bemf, neutral_net, curr_net):
     net(f"DRVDT_{suffix}", drv["21"])    # DT
     net("GND", r_dt["2"])
 
-    # Per-leg: bootstrap cap (VBx<->VSx), high-side FET (drain=VBUS,
+    # Per-leg: bootstrap cap (VBx<->VSx), high-side FET (drain=VBUS_LOAD,
     # source=phase node, gate via resistor from HOx), low-side FET
     # (drain=phase node, source=common motor-return node, gate via
     # resistor from LOx), phase connector out to the motor winding, and
@@ -467,6 +573,9 @@ def motor_block(suffix, ox, oy, hin, lin, bemf, neutral_net, curr_net):
     vb_pins = ("20", "17", "14")   # VB1,VB2,VB3
     vs_pins = ("18", "15", "12")   # VS1,VS2,VS3
     leg_dx = 95
+    bemf_points = []
+    neutral_points = []
+    curr_point = None
     for i, leg in enumerate(("U", "V", "W")):
         lx = ox + 90
         ly = oy + 95 - i * leg_dx
@@ -505,6 +614,7 @@ def motor_block(suffix, ox, oy, hin, lin, bemf, neutral_net, curr_net):
         _, rb2 = place("Device:R", lx + 80, ly - 20, rotation=90, ref_prefix="R", value="10k")
         net(bemf[i], rb2["1"])
         net("GND", rb2["2"])
+        bemf_points.append((bemf[i], (lx + 80, ly)))
 
         # Virtual-neutral summing tap (3x47k converging + 10k to GND,
         # placed after the block below). Offset down a row and given extra
@@ -517,6 +627,8 @@ def motor_block(suffix, ox, oy, hin, lin, bemf, neutral_net, curr_net):
     _, rn_gnd = place("Device:R", ox + 215, oy - 55, rotation=90, ref_prefix="R", value="10k")
     net(neutral_net, rn_gnd["1"])
     net("GND", rn_gnd["2"])
+    hier_label(neutral_net, ox + 260, oy - 55, "output")
+    net(neutral_net, (ox + 260, oy - 55))
 
     # Per-motor unidirectional current sense: shunt in the low-side
     # return path (MOTRTN -> shunt -> GND), INA180-series amp reading
@@ -532,30 +644,155 @@ def motor_block(suffix, ox, oy, hin, lin, bemf, neutral_net, curr_net):
     net("VDD", ina["5"])               # V+
     net("GND", ina["2"])               # amp's own GND pin
     net(curr_net, ina["1"])            # OUT -> ADC
+    hier_label("VDD", ox + 170, oy - 90, "input")
+    net("VDD", (ox + 170, oy - 90))
+    hier_label(curr_net, ox + 170, oy - 70, "output")
+    net(curr_net, (ox + 170, oy - 70))
+
+    # BEMF sense outputs - one hierarchical label per phase, placed near
+    # each divider's midpoint tap rather than bunched together.
+    for net_name, (px, py) in bemf_points:
+        hier_label(net_name, px + 15, py, "output")
+        net(net_name, (px + 15, py))
+
+    return CURRENT
 
 
-# Motor A: TIM1 / ADC1 / ADC3 (DESIGN.md 6.4)
-motor_block(
-    "A", 320, 340,
-    hin=("PA8", "PA9", "PA10"), lin=("PA7", "PB0", "PF0"),
-    bemf=("PA0", "PA1", "PA3"), neutral_net="PB1", curr_net="PB11",
-)
-
-# Motor B: TIM8 / ADC2 / ADC4 (DESIGN.md 6.4)
-motor_block(
-    "B", 320, 650,
-    hin=("PA15", "PB8", "PB9"), lin=("PB3", "PB4", "PB5"),
-    bemf=("PA4", "PA5", "PA6"), neutral_net="PB14", curr_net="PF1",
-)
-
-# Assembly: extract each used symbol's full definition from its source
-# library file (system KiCad libraries, or the local AdapterSymbols.kicad_sym
-# directory copied from aartech-dev/RemoraNSR3.0) and embed it in
-# lib_symbols, exactly how a real KiCad save does it - kicad-cli's ERC reads
-# pin geometry from this embedded cache, not by resolving lib_id against
-# sym-lib-table at check time (confirmed empirically - see commit notes).
 # ---------------------------------------------------------------------------
-import os
+# MAIN (root) sheet: draws the Nucleo-G474RE as a block (a custom symbol
+# authored inline below - there's no real KiCad library part for it, and
+# nothing about its "circuit" is ours to design, so a labeled-pin black box
+# is the right level of detail), plus the three sub-circuit sheets, wired
+# together with real point-to-point wires between matching named pins.
+# ---------------------------------------------------------------------------
+
+NUCLEO_LIB_ID = "Local:Nucleo_G474RE"
+NUCLEO_X, NUCLEO_Y = 90, 40  # symbol placement origin; pin dy is computed as NUCLEO_Y - target_abs_y
+
+
+def nucleo_symbol_text(pin_specs):
+    """pin_specs: list of (net_name, shape, abs_y). Builds the lib_symbols
+    text for a custom black-box symbol representing the physical Nucleo-
+    G474RE dev board this adapter plugs into - all pins on the right edge,
+    dx fixed, dy computed to land each pin at its target absolute Y once
+    placed at (NUCLEO_X, NUCLEO_Y)."""
+    dys = [NUCLEO_Y - abs_y for _, _, abs_y in pin_specs]
+    top, bottom = 20, min(dys) - 20
+    lines = [
+        f'\t(symbol "{NUCLEO_LIB_ID}"',
+        "\t\t(pin_names (offset 0.254))",
+        "\t\t(exclude_from_sim no) (in_bom yes) (on_board yes)",
+        f'\t\t(property "Reference" "U" (at {NUCLEO_X:.2f} {NUCLEO_Y+10:.2f} 0) (effects (font (size 1.27 1.27))))',
+        f'\t\t(property "Value" "Nucleo-G474RE" (at {NUCLEO_X:.2f} {NUCLEO_Y+5:.2f} 0) (effects (font (size 1.27 1.27))))',
+        # Child sub-symbol names must stay bare (no "Local:" prefix) - KiCad
+        # associates a multi-unit/multi-drawing symbol's children to its
+        # parent by name-prefix convention against the *unqualified* name,
+        # not the full lib_id (confirmed empirically: identical to the
+        # AdapterSymbols:* parts elsewhere in this project - qualifying the
+        # children too, which seemed the more consistent choice, silently
+        # broke loading in isolated testing before this was caught).
+        '\t\t(symbol "Nucleo_G474RE_0_1"',
+        f"\t\t\t(rectangle (start -30.00 {top:.2f}) (end 50.00 {bottom:.2f})",
+        "\t\t\t\t(stroke (width 0.254) (type default)) (fill (type background)))",
+        "\t\t)",
+        '\t\t(symbol "Nucleo_G474RE_1_1"',
+    ]
+    for net_name, shape, abs_y in pin_specs:
+        dy = NUCLEO_Y - abs_y
+        lines += [
+            f"\t\t\t(pin {shape} line (at 50.00 {dy:.2f} 180)",
+            "\t\t\t\t(length 5.08)",
+            f'\t\t\t\t(name "{net_name}" (effects (font (size 1.27 1.27))))',
+            f'\t\t\t\t(number "{net_name}" (effects (font (size 1.27 1.27))))',
+            "\t\t\t)",
+        ]
+    lines += ["\t\t)", "\t\t(embedded_fonts no)", "\t)"]
+    return "\n".join(lines)
+
+
+def build_main():
+    global CURRENT
+    CURRENT = Sheet("main", "/")
+
+    power_pins = [
+        ("PA2", "output", 55), ("PB12", "output", 70),
+        ("VDD", "passive", 85), ("GND", "passive", 100),
+        ("VCC", "output", 115), ("VBUS_LOAD", "output", 130),
+    ]
+    motor_a_pins = [
+        ("VCC", "input", 185), ("VDD", "input", 200), ("GND", "passive", 215), ("VBUS_LOAD", "input", 230),
+        ("PA8", "input", 260), ("PA9", "input", 275), ("PA10", "input", 290),
+        ("PA7", "input", 305), ("PB0", "input", 320), ("PF0", "input", 335),
+        ("PA0", "output", 350), ("PA1", "output", 365), ("PA3", "output", 380),
+        ("PB1", "output", 395), ("PB11", "output", 410),
+    ]
+    motor_b_names = ["VCC", "VDD", "GND", "VBUS_LOAD",
+                      "PA15", "PB8", "PB9", "PB3", "PB4", "PB5",
+                      "PA4", "PA5", "PA6", "PB14", "PF1"]
+    motor_b_pins = [
+        (new_name, shape, y + 440)
+        for (old_name, shape, y), new_name in zip(motor_a_pins, motor_b_names)
+    ]
+
+    # Nucleo block: same net-name/shape/abs_y triples as the sheets above,
+    # shape flipped to describe the signal from the Nucleo's own side
+    # (it drives HIN/LIN, senses BEMF/ISENSE/NEUTRAL/PA2/PB12).
+    nucleo_pins = [
+        ("PA2", "input", 55), ("PB12", "input", 70), ("VDD", "passive", 85), ("GND", "passive", 100),
+    ]
+    for name, shape, y in motor_a_pins[4:]:  # GPIO only, not the VCC/VDD/GND/VBUS_LOAD power quartet
+        nucleo_pins.append((name, "output" if shape == "input" else "input", y))
+    for name, shape, y in motor_b_pins[4:]:
+        nucleo_pins.append((name, "output" if shape == "input" else "input", y))
+
+    PINS[NUCLEO_LIB_ID] = {name: (50, NUCLEO_Y - y, 180) for name, _, y in nucleo_pins}
+    nucleo_symtext = nucleo_symbol_text(nucleo_pins)
+    _, nuc = place(NUCLEO_LIB_ID, NUCLEO_X, NUCLEO_Y, ref_prefix="U", value="Nucleo-G474RE", stub=False)
+
+    power_coords = place_sheet("Power", "power.kicad_sch", 250, 40, 140, 110, power_pins, POWER_UUID)
+    motora_coords = place_sheet("Motor A", "motor_a.kicad_sch", 250, 170, 140, 400, motor_a_pins, MOTORA_UUID)
+    motorb_coords = place_sheet("Motor B", "motor_b.kicad_sch", 250, 610, 140, 400, motor_b_pins, MOTORB_UUID)
+
+    # Nucleo <-> Power
+    wire_pts(nuc["PA2"], power_coords["PA2"])
+    wire_pts(nuc["PB12"], power_coords["PB12"])
+    wire_pts(nuc["VDD"], power_coords["VDD"])
+    wire_pts(nuc["GND"], power_coords["GND"])
+
+    # Power -> Motor A -> Motor B (shared rails). Not a direct vertical
+    # wire down the shared x=250 edge: that range also carries the Nucleo
+    # GPIO wires and the *other* rails' own sheet pins, and a long wire
+    # segment picks up any pin its path happens to pass through even
+    # without an explicit vertex there (confirmed the hard way - this is
+    # exactly what merged VCC/VDD/GND into one net the first time this was
+    # tried). Each rail instead jogs out to its own dedicated lane well
+    # past every sheet's right edge (x=390), where nothing else runs.
+    for lane_i, rail in enumerate(("VCC", "VDD", "GND", "VBUS_LOAD")):
+        lane_x = 420 + lane_i * 10
+        for p1, p2 in ((power_coords[rail], motora_coords[rail]), (motora_coords[rail], motorb_coords[rail])):
+            wire_pts(p1, (lane_x, p1[1]))
+            wire(lane_x, p1[1], lane_x, p2[1])
+            wire_pts((lane_x, p2[1]), p2)
+
+    # Nucleo <-> Motor A / Motor B GPIO (each pair placed at matching abs_y,
+    # so these are all single straight horizontal segments too).
+    for name, _, _ in motor_a_pins[4:]:
+        wire_pts(nuc[name], motora_coords[name])
+    for name, _, _ in motor_b_pins[4:]:
+        wire_pts(nuc[name], motorb_coords[name])
+
+    return CURRENT, nucleo_symtext
+
+
+# ---------------------------------------------------------------------------
+# Symbol embedding: extract each used symbol's full definition from its
+# source library file (system KiCad libraries, or the local
+# AdapterSymbols.kicad_sym directory copied from aartech-dev/RemoraNSR3.0)
+# and embed it in each output file's own lib_symbols, exactly how a real
+# KiCad save does it - kicad-cli's ERC reads pin geometry from this embedded
+# cache, not by resolving lib_id against sym-lib-table at check time
+# (confirmed empirically - see commit notes).
+# ---------------------------------------------------------------------------
 
 SYSTEM_LIB_SOURCES = {
     "Device": "/usr/share/kicad/symbols/Device.kicad_sym",
@@ -595,21 +832,6 @@ def extract_symbol_block(source_text, bare_name):
     if end is None:
         raise ValueError(f"symbol {bare_name!r}: unbalanced parens, no matching close found")
     return lines[start:end]
-
-
-def rename_child_units(block, bare_name, full_name):
-    """Renames nested `(symbol "{bare_name}_N_M" ...)` sub-unit drawings to
-    match a renamed parent. KiCad associates a multi-unit symbol's child
-    sub-drawings to its parent purely by name-prefix convention
-    (`"{parent}_{unit}_{style}"`) - renaming only the parent's own header
-    line (as the lib-id-qualifying rename below does) leaves children
-    orphaned under their old bare name, silently breaking pin-geometry
-    lookup for every unit past the first (confirmed empirically: this is
-    why single-unit parts worked immediately but MCP6002 kept reporting
-    correctly-computed pin coordinates as still unconnected)."""
-    prefix = f'\t\t(symbol "{bare_name}_'
-    replacement = f'\t\t(symbol "{full_name}_'
-    return [replacement + line[len(prefix):] if line.startswith(prefix) else line for line in block]
 
 
 def resolve_extends(lib_nick, bare_name, full_name, cache):
@@ -668,48 +890,78 @@ def embed(lib_nick, bare_name, full_name, cache):
     return ["\n".join(b) for b in blocks]
 
 
-used_lib_ids = sorted(set(PINS.keys()))
+def embed_lib_symbols(used_lib_ids, cache, extra_text=None):
+    """Builds the `(lib_symbols ...)` inner text for one output file, given
+    the set of lib_ids actually placed in it (plus, for main.kicad_sch, the
+    inline-authored Nucleo symbol text)."""
+    embedded = []
+    seen = set()
+    for lib_id in sorted(used_lib_ids):
+        lib_nick, bare_name = lib_id.split(":", 1)
+        for text in embed(lib_nick, bare_name, lib_id, cache):
+            name = text.split('"')[1]
+            if name in seen:
+                continue
+            seen.add(name)
+            embedded.append(text)
+    if extra_text:
+        embedded.append(extra_text)
+    return "\n".join(embedded)
+
+
+def write_sheet_file(filename, sheet, lib_symbols_text, is_root):
+    parts = [
+        "(kicad_sch",
+        "\t(version 20250114)",
+        '\t(generator "eeschema")',
+        '\t(generator_version "10.0")',
+        f'\t(uuid "{ROOT_UUID if is_root else u()}")',
+        '\t(paper "A0")' if is_root else '\t(paper "A2")',
+        "\t(lib_symbols",
+        lib_symbols_text,
+        "\t)",
+    ]
+    if sheet.sheet_blocks:
+        parts.append("\n".join(sheet.sheet_blocks))
+    if sheet.symbols:
+        parts.append("\n".join(sheet.symbols))
+    if sheet.wires:
+        parts.append("\n".join(sheet.wires))
+    if sheet.no_connects:
+        parts.append("\n".join(sheet.no_connects))
+    if sheet.hier_labels:
+        parts.append("\n".join(sheet.hier_labels))
+    if sheet.labels:
+        parts.append("\n".join(sheet.labels))
+    if is_root:
+        parts.append('\t(sheet_instances\n\t\t(path "/" (page "1"))\n\t)')
+    parts.append(")")
+    parts.append("")
+    with open(filename, "w") as f:
+        f.write("\n".join(parts))
+
+
 cache = {}
-embedded = []
-seen = set()
-for lib_id in used_lib_ids:
-    lib_nick, bare_name = lib_id.split(":", 1)
-    for text in embed(lib_nick, bare_name, lib_id, cache):
-        # A base symbol pulled in for two different `extends` children
-        # (not the case yet, but cheap to guard) would otherwise be
-        # embedded twice under the same name.
-        name = text.split('"')[1]
-        if name in seen:
-            continue
-        seen.add(name)
-        embedded.append(text)
 
-lib_symbols_block = "\n".join(embedded)
+power_sheet = build_power()
+motora_sheet = build_motor(
+    "A", MOTORA_UUID,
+    hin=("PA8", "PA9", "PA10"), lin=("PA7", "PB0", "PF0"),
+    bemf=("PA0", "PA1", "PA3"), neutral_net="PB1", curr_net="PB11",
+)
+motorb_sheet = build_motor(
+    "B", MOTORB_UUID,
+    hin=("PA15", "PB8", "PB9"), lin=("PB3", "PB4", "PB5"),
+    bemf=("PA4", "PA5", "PA6"), neutral_net="PB14", curr_net="PF1",
+)
+main_sheet, nucleo_symtext = build_main()
 
-output = "\n".join([
-    "(kicad_sch",
-    "\t(version 20250114)",
-    "\t(generator \"eeschema\")",
-    "\t(generator_version \"10.0\")",
-    f'\t(uuid "{u()}")',
-    '\t(paper "A0")',
-    "\t(lib_symbols",
-    lib_symbols_block,
-    "\t)",
-    "\n".join(sch_symbols),
-    "\n".join(sch_wires),
-    "\n".join(sch_no_connects),
-    "\n".join(sch_labels),
-    "\t(sheet_instances",
-    '\t\t(path "/"',
-    '\t\t\t(page "1")',
-    "\t\t)",
-    "\t)",
-    ")",
-    "",
-])
+write_sheet_file("power.kicad_sch", power_sheet, embed_lib_symbols(power_sheet.used_lib_ids, cache), is_root=False)
+write_sheet_file("motor_a.kicad_sch", motora_sheet, embed_lib_symbols(motora_sheet.used_lib_ids, cache), is_root=False)
+write_sheet_file("motor_b.kicad_sch", motorb_sheet, embed_lib_symbols(motorb_sheet.used_lib_ids, cache), is_root=False)
+write_sheet_file("main.kicad_sch", main_sheet, embed_lib_symbols(set(), cache, extra_text=nucleo_symtext), is_root=True)
 
-with open("adapter.kicad_sch", "w") as f:
-    f.write(output)
-
-print(f"Wrote adapter.kicad_sch: {len(sch_symbols)} symbols, {len(sch_labels)} labels")
+print(
+    f"Wrote main.kicad_sch + power/motor_a/motor_b.kicad_sch: "
+    f"{len(power_sheet.symbols)+len(motora_sheet.symbols)+len(motorb_sheet.symbols)+len(main_sheet.symbols)} symbols total"
+)
