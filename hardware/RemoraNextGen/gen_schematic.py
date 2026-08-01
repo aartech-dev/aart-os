@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Generates the adapter's hierarchical KiCad project: main.kicad_sch (root -
-draws the Nucleo-G474RE as a block, plus three sub-sheet blocks, wired
-together with real point-to-point wires between named pins) and three child
-sheets (power.kicad_sch, motor_a.kicad_sch, motor_b.kicad_sch) holding the
-actual circuits.
+"""Generates the RemoraNextGen hierarchical KiCad project:
+RemoraNextGen.kicad_sch (root - draws the Nucleo-G474RE as a block, plus
+three sub-sheet blocks, wired together with real point-to-point wires
+between named pins) and three child sheets (power.kicad_sch,
+motor_a.kicad_sch, motor_b.kicad_sch) holding the actual circuits.
 
 Hand-authoring this many near-identical KiCad symbol/sheet-placement blocks
 directly is repetitive and error-prone; this script computes exact pin
 coordinates (component position + library pin offset, rotated) and emits
 both the symbol placement and a matching label at each net connection, so
 connectivity is correct by construction. Run, then validate with
-`kicad-cli sch erc main.kicad_sch`.
+`kicad-cli sch erc RemoraNextGen.kicad_sch`.
 """
 import math
 import os
@@ -25,6 +25,10 @@ def rot(x, y, deg):
     r = math.radians(deg)
     return (x * math.cos(r) - y * math.sin(r), x * math.sin(r) + y * math.cos(r))
 
+
+# Must match the .kicad_pro's basename - KiCad stamps this into every
+# instance path and rewrites it to match on next save if it doesn't.
+PROJECT_NAME = "RemoraNextGen"
 
 # Fixed so re-running the generator doesn't change sheet identity/paths.
 ROOT_UUID = "10000000-0000-0000-0000-000000000001"
@@ -196,7 +200,7 @@ def place(lib_id, x, y, rotation=0, ref=None, ref_prefix="U", value=None, footpr
     ]
     text += props
     text += pin_lines
-    text.append(f'\t\t(instances (project "adapter" (path "{CURRENT.path_prefix}" (reference "{ref}") (unit {unit}))))')
+    text.append(f'\t\t(instances (project "{PROJECT_NAME}" (path "{CURRENT.path_prefix}" (reference "{ref}") (unit {unit}))))')
     text.append("\t)")
     CURRENT.symbols.append("\n".join(text))
 
@@ -313,7 +317,7 @@ def place_sheet(name, filename, x, y, w, h, pins, sheet_uuid):
     for net_name, shape, py in pins:
         lines.append(f'\t\t(pin "{net_name}" {shape} (at {x:.2f} {py:.2f} 180) (effects (font (size 1.27 1.27))))')
         abs_coords[net_name] = (x, py)
-    lines.append(f'\t\t(instances (project "adapter" (path "/{ROOT_UUID}" (page "{PAGE_COUNTER[0]}"))))')
+    lines.append(f'\t\t(instances (project "{PROJECT_NAME}" (path "/{ROOT_UUID}" (page "{PAGE_COUNTER[0]}"))))')
     PAGE_COUNTER[0] += 1
     lines.append("\t)")
     CURRENT.sheet_blocks.append("\n".join(lines))
@@ -509,7 +513,7 @@ def build_power():
 # unidirectional current-sense amp (DESIGN.md 6.5's "what scales with motor
 # count" block, x2 for front/rear). GPIO net names match DESIGN.md 6.4's pin
 # table (superseded for BEMF_C/neutral/current by the G474 retarget) and are
-# exposed as hierarchical labels so the Nucleo block on main.kicad_sch can
+# exposed as hierarchical labels so the Nucleo block on RemoraNextGen.kicad_sch can
 # be wired to them directly by name.
 # ---------------------------------------------------------------------------
 
@@ -530,7 +534,7 @@ def build_motor(suffix, sheet_uuid, hin, lin, bemf, neutral_net, curr_net):
     net(lin[2], drv["3"])   # LIN3
 
     # Boundary pins - one hierarchical label per GPIO/power net crossing to
-    # the Nucleo block or the Power sheet (wired up on main.kicad_sch).
+    # the Nucleo block or the Power sheet (wired up on RemoraNextGen.kicad_sch).
     # Placed well below the hin/lin loops' range (oy+40 down to oy-35) so
     # these don't land on the exact same coordinate as one of those labels
     # (confirmed as a real bug: two differently-named hierarchical labels
@@ -957,7 +961,7 @@ def embed(lib_nick, bare_name, full_name, cache):
 
 def embed_lib_symbols(used_lib_ids, cache, extra_text=None):
     """Builds the `(lib_symbols ...)` inner text for one output file, given
-    the set of lib_ids actually placed in it (plus, for main.kicad_sch, the
+    the set of lib_ids actually placed in it (plus, for RemoraNextGen.kicad_sch, the
     inline-authored Nucleo symbol text)."""
     embedded = []
     seen = set()
@@ -1024,9 +1028,9 @@ main_sheet, nucleo_symtext = build_main()
 write_sheet_file("power.kicad_sch", power_sheet, embed_lib_symbols(power_sheet.used_lib_ids, cache), is_root=False)
 write_sheet_file("motor_a.kicad_sch", motora_sheet, embed_lib_symbols(motora_sheet.used_lib_ids, cache), is_root=False)
 write_sheet_file("motor_b.kicad_sch", motorb_sheet, embed_lib_symbols(motorb_sheet.used_lib_ids, cache), is_root=False)
-write_sheet_file("main.kicad_sch", main_sheet, embed_lib_symbols(set(), cache, extra_text=nucleo_symtext), is_root=True)
+write_sheet_file(f"{PROJECT_NAME}.kicad_sch", main_sheet, embed_lib_symbols(set(), cache, extra_text=nucleo_symtext), is_root=True)
 
 print(
-    f"Wrote main.kicad_sch + power/motor_a/motor_b.kicad_sch: "
+    f"Wrote {PROJECT_NAME}.kicad_sch + power/motor_a/motor_b.kicad_sch: "
     f"{len(power_sheet.symbols)+len(motora_sheet.symbols)+len(motorb_sheet.symbols)+len(main_sheet.symbols)} symbols total"
 )

@@ -11,41 +11,42 @@ two independent motor driver+bridge+sense stages (front/rear axles).
 
 Hierarchical project, 4 sheets:
 
-- `kicad/main.kicad_sch` — root sheet. Draws the Nucleo-G474RE itself as a
+- `RemoraNextGen.kicad_pro` — the KiCad project file; open this in KiCad.
+- `RemoraNextGen.kicad_sch` — root sheet. Draws the Nucleo-G474RE itself as a
   labeled-pin block (there's no real circuit of ours inside it, so a block
   with named pins is the right level of detail — see "The Nucleo block"
   below), plus three sub-circuit sheets (`Power`, `Motor A`, `Motor B`) as
   boxes with their own named pins, wired together with real point-to-point
   wires between matching pins — open this file first.
-- `kicad/power.kicad_sch` — shared front end: track power in,
+- `power.kicad_sch` — shared front end: track power in,
   reverse-polarity protection, boost regulator, logic LDO, shared
   bidirectional track-current sense, bus-voltage divider.
-- `kicad/motor_a.kicad_sch`, `kicad/motor_b.kicad_sch` — one DRV8300D +
+- `motor_a.kicad_sch`, `motor_b.kicad_sch` — one DRV8300D +
   6×CSD16327Q3 bridge + bootstrap caps + BEMF dividers + virtual-neutral
   summing network + current-sense amp each (front/rear axles).
-- `kicad/gen_schematic.py` — generates all 4 files above from a
+- `gen_schematic.py` — generates all 4 files above from a
   data-driven component/net list. Hand-authoring this many near-identical
   KiCad symbol/sheet-placement blocks directly is repetitive and
   error-prone; this script computes exact pin coordinates (component
   position + library pin offset, rotated) and emits both the placement and
   a matching label at each net connection, so connectivity is correct by
   construction. Run `python3 gen_schematic.py`, then validate with
-  `kicad-cli sch erc main.kicad_sch` (this walks the whole hierarchy, not
-  just the root file). **Don't hand-edit the 4 generated `.kicad_sch`
+  `kicad-cli sch erc RemoraNextGen.kicad_sch` (this walks the whole hierarchy,
+  not just the root file). **Don't hand-edit the 4 generated `.kicad_sch`
   files** — they're regenerated from this script and edits will be lost.
-- `kicad/AdapterSymbols.kicad_sym/`, `kicad/AdapterFootprints.pretty/` —
+- `AdapterSymbols.kicad_sym/`, `AdapterFootprints.pretty/` —
   project-specific parts (gate driver, bridge FETs, boost regulator, LDO,
   reverse-protection diode/zener) copied from
   [aartech-dev/RemoraNSR3.0](https://github.com/aartech-dev/RemoraNSR3.0),
   the real single-motor ESC board `DESIGN.md` §6.5 cross-references.
-- `kicad/sym-lib-table`, `kicad/fp-lib-table` — project library tables
+- `sym-lib-table`, `fp-lib-table` — project library tables
   (the local libraries above, plus standard KiCad system libraries).
-- `kicad/bom.csv` — grouped BOM across the whole hierarchy
-  (`kicad-cli sch export bom main.kicad_sch`).
+- `bom.csv` — grouped BOM across the whole hierarchy
+  (`kicad-cli sch export bom RemoraNextGen.kicad_sch`).
 
 ## The Nucleo block
 
-`main.kicad_sch` draws the Nucleo-G474RE as a custom black-box symbol
+`RemoraNextGen.kicad_sch` draws the Nucleo-G474RE as a custom black-box symbol
 (authored inline in `gen_schematic.py`, not a real KiCad library part —
 there's nothing about the Nucleo's own circuit that's ours to design) with
 one pin per net it actually exchanges with this board: the 22 motor GPIO
@@ -110,7 +111,7 @@ guessed from memory): TI DRV8300D (3-phase gate driver), TI CSD16327Q3
 
 ## Layout notes
 
-`main.kicad_sch` is A0 (the Nucleo block plus three sheet boxes, wired,
+`RemoraNextGen.kicad_sch` is A0 (the Nucleo block plus three sheet boxes, wired,
 spans well past A1); `power`/`motor_a`/`motor_b.kicad_sch` are each A2
 (each sub-circuit alone still exceeds A3 - this bit the project twice,
 first on the original flat single-sheet layout, then again on each
@@ -138,7 +139,7 @@ directly, bypassing the shunt entirely. Fixed by wiring the bridges to
 current-sense amp actually sees load current now rather than a stray
 branch current.
 
-On `main.kicad_sch`, the four rails shared between `Power` and both motor
+On `RemoraNextGen.kicad_sch`, the four rails shared between `Power` and both motor
 sheets (`VCC`/`VDD`/`GND`/`VBUS_LOAD`) are **not** routed as a straight
 wire down the sheets' shared edge - that corridor also carries the Nucleo
 GPIO wires and the other rails' own sheet pins, and a long wire segment
@@ -152,17 +153,16 @@ every sheet's right edge, where nothing else runs.
 
 ## Known/accepted ERC findings
 
-`kicad-cli sch erc main.kicad_sch` reports **0 errors** across the whole
+`kicad-cli sch erc RemoraNextGen.kicad_sch` reports **0 errors** across the whole
 hierarchy. Two categories of warning are expected and were deliberately
 left rather than hacked around:
 
 - **`lib_symbol_issues` / `endpoint_off_grid` warnings**: cosmetic.
-  `kicad-cli` run without a `.kicad_pro` doesn't consult `sym-lib-table`
-  (harmless — every symbol used is fully embedded in each file's own
-  `lib_symbols` cache, which is what ERC actually reads pin geometry
-  from); off-grid warnings come from computing pin coordinates in exact
-  mm rather than always landing on the 0.1"/2.54mm grid, and are purely
-  visual.
+  ERC doesn't resolve pin geometry against `sym-lib-table` (harmless —
+  every symbol used is fully embedded in each file's own `lib_symbols`
+  cache, which is what ERC actually reads pin geometry from); off-grid
+  warnings come from computing pin coordinates in exact mm rather than
+  always landing on the 0.1"/2.54mm grid, and are purely visual.
 - **`multiple_net_names`**: intentional net aliasing (e.g. `VBUS` and
   `TRACK_PWR` are the same physical node by design - see the module
   comments in `gen_schematic.py`'s `build_power()`).
@@ -212,6 +212,5 @@ left rather than hacked around:
 ## Not done here
 
 No PCB layout, no footprint assignment (BOM's footprint column is empty —
-footprints weren't the focus of this pass), no `.kicad_pro` project file.
-This is a schematic-and-BOM-level design pass; turning it into an actual
-board is further work.
+footprints weren't the focus of this pass). This is a schematic-and-BOM-level
+design pass; turning it into an actual board is further work.
