@@ -1,5 +1,6 @@
 {
   "board": {
+    "3dviewports": [],
     "design_settings": {
       "defaults": {},
       "diff_pair_dimensions": [],
@@ -7,9 +8,30 @@
       "rules": {},
       "track_widths": [],
       "via_dimensions": []
-    }
+    },
+    "ipc2581": {
+      "bom_rev": "",
+      "dist": "",
+      "distpn": "",
+      "internal_id": "",
+      "mfg": "",
+      "mpn": "",
+      "sch_revision": ""
+    },
+    "layer_pairs": [],
+    "layer_presets": [],
+    "viewports": []
   },
   "boards": [],
+  "component_class_settings": {
+    "assignments": [],
+    "meta": {
+      "version": 0
+    },
+    "sheet_component_classes": {
+      "enabled": false
+    }
+  },
   "cvpcb": {
     "equivalence_files": []
   },
@@ -18,6 +40,176 @@
     "meta": {
       "version": 0
     },
+    "pin_map": [
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        2
+      ],
+      [
+        0,
+        2,
+        0,
+        1,
+        0,
+        0,
+        1,
+        0,
+        2,
+        2,
+        2,
+        2
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        1,
+        0,
+        1,
+        2
+      ],
+      [
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        2,
+        1,
+        1,
+        2
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        2
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        2
+      ],
+      [
+        1,
+        1,
+        1,
+        1,
+        1,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2
+      ],
+      [
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        2
+      ],
+      [
+        0,
+        2,
+        1,
+        2,
+        0,
+        0,
+        1,
+        0,
+        2,
+        2,
+        2,
+        2
+      ],
+      [
+        0,
+        2,
+        0,
+        1,
+        0,
+        0,
+        1,
+        0,
+        2,
+        0,
+        0,
+        2
+      ],
+      [
+        0,
+        2,
+        1,
+        1,
+        0,
+        0,
+        1,
+        0,
+        2,
+        0,
+        0,
+        2
+      ],
+      [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ]
+    ],
     "rule_severities": {
       "bus_definition_conflict": "error",
       "bus_entry_needed": "error",
@@ -93,6 +285,7 @@
         "priority": 2147483647,
         "schematic_color": "rgba(0, 0, 0, 0.000)",
         "track_width": 0.2,
+        "tuning_profile": "",
         "via_diameter": 0.6,
         "via_drill": 0.3,
         "wire_width": 6
@@ -106,10 +299,22 @@
     "netclass_patterns": []
   },
   "pcbnew": {
+    "last_paths": {
+      "idf": "",
+      "netlist": "",
+      "plot": "",
+      "specctra_dsn": "",
+      "step": "",
+      "vrml": ""
+    },
     "page_layout_descr_file": ""
   },
   "schematic": {
     "annotate_start_num": 0,
+    "annotation": {
+      "method": 0,
+      "sort_order": 0
+    },
     "bom_export_filename": "",
     "bom_fmt_presets": [],
     "bom_fmt_settings": {
@@ -177,6 +382,7 @@
       "default_line_thickness": 6.0,
       "default_text_size": 50.0,
       "field_names": [],
+      "hop_over_size_choice": 0,
       "intersheets_ref_own_page": false,
       "intersheets_ref_prefix": "",
       "intersheets_ref_short": false,
@@ -184,6 +390,11 @@
       "intersheets_ref_suffix": "",
       "junction_size_choice": 3,
       "label_size_ratio": 0.375,
+      "operating_point_overlay_i_precision": 3,
+      "operating_point_overlay_i_range": "~A",
+      "operating_point_overlay_v_precision": 3,
+      "operating_point_overlay_v_range": "~V",
+      "overbar_offset_ratio": 1.23,
       "pin_symbol_size": 25.0,
       "text_offset_ratio": 0.15
     },
@@ -204,6 +415,7 @@
     },
     "page_layout_descr_file": "",
     "plot_directory": "",
+    "reuse_designators": true,
     "spice_adjust_passive_values": false,
     "spice_current_sheet_as_root": false,
     "spice_external_command": "spice \"%I\"",
@@ -217,7 +429,7 @@
       {
         "filename": "RemoraNextGen.kicad_sch",
         "name": "RemoraNextGen",
-        "uuid": "00000000-0000-0000-0000-000000000000"
+        "uuid": "10000000-0000-0000-0000-000000000001"
       }
     ],
     "used_designators": "",
@@ -226,7 +438,7 @@
   "sheets": [
     [
       "10000000-0000-0000-0000-000000000001",
-      "Root"
+      "RemoraNextGen"
     ],
     [
       "10000000-0000-0000-0000-000000000002",
@@ -241,5 +453,11 @@
       "Motor B"
     ]
   ],
-  "text_variables": {}
+  "text_variables": {},
+  "tuning_profiles": {
+    "meta": {
+      "version": 0
+    },
+    "tuning_profiles_impedance_geometric": []
+  }
 }

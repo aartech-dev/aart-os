@@ -131,6 +131,7 @@ class Sheet:
         self.no_connects = []
         self.hier_labels = []
         self.sheet_blocks = []
+        self.net_points = {}
         self.used_lib_ids = set()
 
 
@@ -285,13 +286,49 @@ def pwr_flag(x, y):
 
 
 def net(name, *points):
-    """Connects every (x,y) point to the same sheet-local net via matching labels."""
-    for (x, y) in points:
-        label(name, *point_xy(x, y))
+    """Registers (x,y) points as belonging to the same sheet-local net.
+    Connectivity is materialized later by finalize_nets(): a net with
+    exactly two distinct points gets a real drawn wire between them (the
+    common case - two nearby component pins); a net touched at three or
+    more points (GND, VCC, VDD and other rails fanning out across the
+    whole sheet) falls back to matching labels at each point instead,
+    same as a real schematic uses power/net labels rather than literal
+    wire to every pin on a shared rail."""
+    CURRENT.net_points.setdefault(name, []).extend(points)
 
 
-def point_xy(x, y):
-    return (x, y)
+def wire_route(p1, p2):
+    """Direct wire if already aligned, else a 3-segment jog through the
+    midpoint x. Deliberately NOT a 2-segment jog through (p2.x, p1.y) or
+    (p1.x, p2.y): those corners sit exactly on p1's row or p2's column,
+    which is usually already "hot" with some unrelated pin/hier_label at
+    a shared round-numbered coordinate (confirmed the hard way - that's
+    what silently shorted a motor's current-sense output onto the shared
+    VDD rail, via a jog corner that landed exactly on VDD's own
+    hier_label a few mm away). An arbitrary computed midpoint x is much
+    less likely to coincide with another element's own placement."""
+    if p1[0] == p2[0] or p1[1] == p2[1]:
+        wire_pts(p1, p2)
+    else:
+        # Snapped to the 1.27mm connection grid - an unrounded float
+        # midpoint works electrically but flags as an off-grid endpoint.
+        mid_x = round((p1[0] + p2[0]) / 2 / 1.27) * 1.27
+        wire_pts(p1, (mid_x, p1[1]))
+        wire_pts((mid_x, p1[1]), (mid_x, p2[1]))
+        wire_pts((mid_x, p2[1]), p2)
+
+
+def finalize_nets():
+    """Turns CURRENT's accumulated net() registrations into either a real
+    wire (exactly 2 distinct points) or matching labels (3+ points, or a
+    single point kept only for documentation)."""
+    for name, points in CURRENT.net_points.items():
+        uniq = list(dict.fromkeys(points))
+        if len(uniq) == 2:
+            wire_route(*uniq)
+        else:
+            for p in uniq:
+                label(name, *p)
 
 
 def place_sheet(name, filename, x, y, w, h, pins, sheet_uuid):
@@ -504,6 +541,7 @@ def build_power():
     hier_label("GND", 40, 105, "passive")
     net("GND", (40, 105))
 
+    finalize_nets()
     return CURRENT
 
 
@@ -659,6 +697,7 @@ def build_motor(suffix, sheet_uuid, hin, lin, bemf, neutral_net, curr_net):
         hier_label(net_name, px + 15, py, "output")
         net(net_name, (px + 15, py))
 
+    finalize_nets()
     return CURRENT
 
 
@@ -785,6 +824,22 @@ def route_lane(p1, p2, lane_x):
     wire_pts((lane_x, p2[1]), p2)
 
 
+LANE_SPACING = 6.0   # clear separation between adjacent parallel lanes
+GROUP_GAP = 16.0     # extra gap between one destination sheet's lane group and the next
+
+
+def route_group(pairs, lane_x):
+    """Routes each (source, target) pair in its own lane, lanes packed
+    LANE_SPACING apart. Returns the next free lane_x (past this group's
+    own lanes plus GROUP_GAP), so consecutive groups land as visually
+    distinct bundles - one comb per destination sheet - rather than one
+    solid 26-wide trunk that's impossible to trace by eye."""
+    for p1, p2 in pairs:
+        route_lane(p1, p2, lane_x)
+        lane_x += LANE_SPACING
+    return lane_x + GROUP_GAP
+
+
 def build_main():
     global CURRENT
     CURRENT = Sheet("main", "/")
@@ -817,36 +872,46 @@ def build_main():
     def nuc(net_name):
         return nuc_by_pin[NUCLEO_NET_TO_PIN[net_name]]
 
-    power_coords = place_sheet("Power", "power.kicad_sch", 250, 40, 140, 110, power_pins, POWER_UUID)
-    motora_coords = place_sheet("Motor A", "motor_a.kicad_sch", 250, 170, 140, 400, motor_a_pins, MOTORA_UUID)
-    motorb_coords = place_sheet("Motor B", "motor_b.kicad_sch", 250, 610, 140, 400, motor_b_pins, MOTORB_UUID)
-
     # Nucleo <-> Power/Motor A/Motor B: the real symbol's pins don't line
     # up with the sheets' pins the way the old hand-authored block's did
     # (its pin order was ours to choose; this one's is the real board's),
     # so every one of these gets its own dedicated routing lane rather
-    # than a straight wire.
-    lane_x = 110
-    for name in ("PA2", "PB12", "VDD", "GND"):
-        route_lane(nuc(name), power_coords[name], lane_x)
-        lane_x += 4
-    for name, _, _ in motor_a_pins[4:]:
-        route_lane(nuc(name), motora_coords[name], lane_x)
-        lane_x += 4
-    for name, _, _ in motor_b_pins[4:]:
-        route_lane(nuc(name), motorb_coords[name], lane_x)
-        lane_x += 4
+    # than a straight wire. Lanes are grouped one bundle per destination
+    # sheet (with a visible gap between bundles) instead of one shared
+    # 26-wide sequence - a single trunk that dense reads as an
+    # indistinguishable cable mess even though every lane is electrically
+    # distinct (confirmed by rendering it - ERC was clean, but at any
+    # normal zoom the 4mm-apart parallel runs visually merge). Lane count
+    # dictates how far right the sheets themselves need to start, so the
+    # x layout is computed here rather than hardcoded.
+    lane_x = 130.0  # clear of the Nucleo symbol body/pin numbers (pin tips end at x=92.86)
+    power_lane_x0 = lane_x
+    lane_x += (len(power_pins[:4])) * LANE_SPACING + GROUP_GAP
+    motora_lane_x0 = lane_x
+    lane_x += len(motor_a_pins[4:]) * LANE_SPACING + GROUP_GAP
+    motorb_lane_x0 = lane_x
+    lane_x += len(motor_b_pins[4:]) * LANE_SPACING + GROUP_GAP
+    sheet_x = lane_x + 20.0  # margin between the last lane and the sheets' own left-edge pins
+
+    power_coords = place_sheet("Power", "power.kicad_sch", sheet_x, 40, 140, 110, power_pins, POWER_UUID)
+    motora_coords = place_sheet("Motor A", "motor_a.kicad_sch", sheet_x, 170, 140, 400, motor_a_pins, MOTORA_UUID)
+    motorb_coords = place_sheet("Motor B", "motor_b.kicad_sch", sheet_x, 610, 140, 400, motor_b_pins, MOTORB_UUID)
+
+    route_group([(nuc(name), power_coords[name]) for name in ("PA2", "PB12", "VDD", "GND")], power_lane_x0)
+    route_group([(nuc(name), motora_coords[name]) for name, _, _ in motor_a_pins[4:]], motora_lane_x0)
+    route_group([(nuc(name), motorb_coords[name]) for name, _, _ in motor_b_pins[4:]], motorb_lane_x0)
 
     # Power -> Motor A -> Motor B (shared rails). Not a direct vertical
-    # wire down the shared x=250 edge: that range also carries the Nucleo
-    # GPIO wires and the *other* rails' own sheet pins, and a long wire
-    # segment picks up any pin its path happens to pass through even
+    # wire down the sheets' shared left edge: that range also carries the
+    # Nucleo GPIO wires and the *other* rails' own sheet pins, and a long
+    # wire segment picks up any pin its path happens to pass through even
     # without an explicit vertex there (confirmed the hard way - this is
     # exactly what merged VCC/VDD/GND into one net the first time this was
     # tried). Each rail instead jogs out to its own dedicated lane well
-    # past every sheet's right edge (x=390), where nothing else runs.
+    # past every sheet's right edge, where nothing else runs.
+    bus_lane_x0 = sheet_x + 140 + 30.0
     for lane_i, rail in enumerate(("VCC", "VDD", "GND", "VBUS_LOAD")):
-        bus_lane_x = 420 + lane_i * 10
+        bus_lane_x = bus_lane_x0 + lane_i * 10
         route_lane(power_coords[rail], motora_coords[rail], bus_lane_x)
         route_lane(motora_coords[rail], motorb_coords[rail], bus_lane_x)
 

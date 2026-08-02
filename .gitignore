@@ -22,3 +22,4 @@ target
 
 # KiCad local project settings (window layout, recently-used state) - not portable across machines
 *.kicad_prl
+*-backups/
