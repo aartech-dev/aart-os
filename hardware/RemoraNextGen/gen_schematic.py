@@ -287,13 +287,14 @@ def pwr_flag(x, y):
 
 def net(name, *points):
     """Registers (x,y) points as belonging to the same sheet-local net.
-    Connectivity is materialized later by finalize_nets(): a net with
-    exactly two distinct points gets a real drawn wire between them (the
-    common case - two nearby component pins); a net touched at three or
-    more points (GND, VCC, VDD and other rails fanning out across the
-    whole sheet) falls back to matching labels at each point instead,
-    same as a real schematic uses power/net labels rather than literal
-    wire to every pin on a shared rail."""
+    Connectivity is materialized later by finalize_nets(): points that
+    stay within a local cluster get a real drawn wire chaining them
+    together (the common case - a handful of nearby component pins on
+    one signal); a net whose points are spread over a wide span (GND,
+    VCC, VDD and other rails fanning out across the whole sheet) falls
+    back to matching labels at each point instead, same as a real
+    schematic uses power/net labels rather than literal wire to every
+    pin on a shared rail."""
     CURRENT.net_points.setdefault(name, []).extend(points)
 
 
@@ -318,17 +319,35 @@ def wire_route(p1, p2):
         wire_pts((mid_x, p2[1]), p2)
 
 
+RAIL_SPAN = 150.0  # mm - beyond this, treat the net as a page-spanning rail
+
+
 def finalize_nets():
-    """Turns CURRENT's accumulated net() registrations into either a real
-    wire (exactly 2 distinct points) or matching labels (3+ points, or a
-    single point kept only for documentation)."""
+    """Turns CURRENT's accumulated net() registrations into either real
+    wire(s) or matching labels. A single point just gets a label (nothing
+    to connect to). Two or more points get chained together left-to-right
+    (sorted by x, then y) with a real wire between each consecutive pair -
+    *unless* the points span more than RAIL_SPAN in either axis, in which
+    case it's a de-facto rail (GND, VCC, VDD, VBUS, a phase node visited
+    by every bridge FET *and* the output connector *and* a sense divider)
+    and gets labels instead: chaining a wire across that much of the page
+    would just recreate the overlapping-lane mess the main sheet's Nucleo
+    routing had, for no readability benefit over a label on a genuinely
+    sheet-wide net."""
     for name, points in CURRENT.net_points.items():
         uniq = list(dict.fromkeys(points))
-        if len(uniq) == 2:
-            wire_route(*uniq)
-        else:
+        if len(uniq) == 1:
+            label(name, *uniq[0])
+            continue
+        xs = [p[0] for p in uniq]
+        ys = [p[1] for p in uniq]
+        if max(xs) - min(xs) > RAIL_SPAN or max(ys) - min(ys) > RAIL_SPAN:
             for p in uniq:
                 label(name, *p)
+        else:
+            uniq.sort()
+            for a, b in zip(uniq, uniq[1:]):
+                wire_route(a, b)
 
 
 def place_sheet(name, filename, x, y, w, h, pins, sheet_uuid):
@@ -859,8 +878,19 @@ def build_main():
     motor_b_names = ["VCC", "VDD", "GND", "VBUS_LOAD",
                       "PA15", "PB8", "PB9", "PB3", "PB4", "PB5",
                       "PA4", "PA5", "PA6", "PB14", "PF1"]
+    # Sheet-box Y layout, computed rather than hardcoded so it can't drift
+    # out of sync with the page again: Motor A/B only actually use pin rows
+    # up to relative +240 (see motor_a_pins above, box-top-relative), so
+    # MOTOR_SHEET_H gives that a bit of margin rather than the old flat 400
+    # (which let Motor B's box run to absolute y=1010 - past A0 landscape's
+    # 841mm height, i.e. off the actual page - confirmed by rendering it).
+    POWER_Y0, POWER_H = 40, 110
+    SHEET_GAP = 20
+    MOTOR_SHEET_H = 260
+    MOTORA_Y0 = POWER_Y0 + POWER_H + SHEET_GAP
+    MOTORB_Y0 = MOTORA_Y0 + MOTOR_SHEET_H + SHEET_GAP
     motor_b_pins = [
-        (new_name, shape, y + 440)
+        (new_name, shape, y + (MOTORB_Y0 - MOTORA_Y0))
         for (old_name, shape, y), new_name in zip(motor_a_pins, motor_b_names)
     ]
 
@@ -893,9 +923,9 @@ def build_main():
     lane_x += len(motor_b_pins[4:]) * LANE_SPACING + GROUP_GAP
     sheet_x = lane_x + 20.0  # margin between the last lane and the sheets' own left-edge pins
 
-    power_coords = place_sheet("Power", "power.kicad_sch", sheet_x, 40, 140, 110, power_pins, POWER_UUID)
-    motora_coords = place_sheet("Motor A", "motor_a.kicad_sch", sheet_x, 170, 140, 400, motor_a_pins, MOTORA_UUID)
-    motorb_coords = place_sheet("Motor B", "motor_b.kicad_sch", sheet_x, 610, 140, 400, motor_b_pins, MOTORB_UUID)
+    power_coords = place_sheet("Power", "power.kicad_sch", sheet_x, POWER_Y0, 140, POWER_H, power_pins, POWER_UUID)
+    motora_coords = place_sheet("Motor A", "motor_a.kicad_sch", sheet_x, MOTORA_Y0, 140, MOTOR_SHEET_H, motor_a_pins, MOTORA_UUID)
+    motorb_coords = place_sheet("Motor B", "motor_b.kicad_sch", sheet_x, MOTORB_Y0, 140, MOTOR_SHEET_H, motor_b_pins, MOTORB_UUID)
 
     route_group([(nuc(name), power_coords[name]) for name in ("PA2", "PB12", "VDD", "GND")], power_lane_x0)
     route_group([(nuc(name), motora_coords[name]) for name, _, _ in motor_a_pins[4:]], motora_lane_x0)
